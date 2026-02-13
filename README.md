@@ -129,6 +129,18 @@ Optional MEX compilation (for speed in 2D distance computation):
 mex mex_computeSignedDistance.cpp
 ```
 
+## Example Plots
+
+The following figures are included in this repository. Click each preview to open the original PDF.
+
+### 2D Star-Shaped Domain
+
+[![2D Star-Shaped Domain](figures/TwoDStarDomain.png)](TwoDStarDomain.pdf)
+
+### 2D Star-Domain Solution
+
+[![2D Star-Domain Solution](figures/TwoDStarDomainSolution.png)](TwoDStarDomainSolution.pdf)
+
 ## Packaging Notes
 
 To keep this repository portable and GitHub-friendly, precomputed cache/data files (`*.mat`), platform-specific binaries (`*.mex*`), and system files (`.DS_Store`) were excluded from this package. Scripts regenerate needed cache files during execution.
