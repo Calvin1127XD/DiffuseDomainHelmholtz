@@ -1,0 +1,1027 @@
+<BenchmarkFMM.m>
+% Benchmark_FMM.m
+% Compares C++ MEX Fast Marching vs Pure MATLAB Implementation
+
+clear; clc;
+
+% 1. Setup
+N_values = [256, 512, 1024, 2048]; % Resolutions to test
+numTests = length(N_values);
+
+xyLower = [-3.0, -3.0];
+xyUpper = [ 3.0,  3.0];
+
+fprintf('==========================================================\n');
+fprintf('  FMM BENCHMARK: C++ MEX vs MATLAB\n');
+fprintf('==========================================================\n');
+fprintf('|   N   |  Time C++ (s) | Time ML (s) | Speedup | L2 Diff |\n');
+fprintf('|-------|---------------|-------------|---------|---------|\n');
+
+for k = 1:numTests
+    n = N_values(k);
+    
+    % Grid
+    h = (xyUpper(1) - xyLower(1)) / n;
+    x = linspace(xyLower(1)+h/2, xyUpper(1)-h/2, n);
+    y = linspace(xyLower(2)+h/2, xyUpper(2)-h/2, n);
+    [X, Y] = ndgrid(x, y);
+    
+    % Boundary
+    [polyX, polyY] = generateBoundary(2000);
+    
+    % --- Run C++ MEX ---
+    % Warmup (first run can handle memory allocation overhead)
+    phi_cpp = mex_computeSignedDistance(X, Y, polyX, polyY, h); 
+    
+    tic;
+    phi_cpp = mex_computeSignedDistance(X, Y, polyX, polyY, h);
+    t_cpp = toc;
+    
+    % --- Run Pure MATLAB ---
+    % Warning: large grids in MATLAB loop are slow
+    tic;
+    phi_ml = computeSignedDistance_MATLAB(X, Y, polyX, polyY, h);
+    t_ml = toc;
+    
+    % --- Comparison ---
+    % Compute L2 difference relative to grid size
+    diff = phi_cpp - phi_ml;
+    l2_err = sqrt(sum(diff(:).^2) / numel(diff));
+    
+    speedup = t_ml / t_cpp;
+    
+    fprintf('| %5d | %13.4f | %11.4f | %7.1fx | %7.2e |\n', ...
+        n, t_cpp, t_ml, speedup, l2_err);
+        
+    % Store for plotting
+    results(k).N = n;
+    results(k).t_cpp = t_cpp;
+    results(k).t_ml = t_ml;
+end
+fprintf('==========================================================\n');
+
+% Validation Plot for the largest grid
+figure(1); clf;
+tiledlayout(1,3);
+
+nexttile;
+contourf(X, Y, phi_cpp, 20, 'LineColor', 'none');
+axis equal tight; title('C++ Result'); colorbar;
+
+nexttile;
+contourf(X, Y, phi_ml, 20, 'LineColor', 'none');
+axis equal tight; title('MATLAB Result'); colorbar;
+
+nexttile;
+% Plot difference
+contourf(X, Y, abs(phi_cpp - phi_ml), 20, 'LineColor', 'none');
+axis equal tight; title('Absolute Difference'); colorbar;
+colormap(gca, 'jet');--------------
+<FDOperator.m>
+function operatorResult = FDOperator(u,DeW,DnS,C,hf)
+
+nfPlusGhostLayers = size(u);
+nf = nfPlusGhostLayers-2;
+
+nx = nf(1);
+ny = nf(2);
+hf2 = hf*hf;
+
+% Vectorized Code for the operator:
+%
+% - div(D grad(u)) + C(x) u 
+%
+% Compute east-west and north-south fluxes:
+feW(1:nx+1,1:ny) = DeW(1:nx+1,1:ny).*(u(2:nx+2,2:ny+1)...
+                   -u(1:nx+1,2:ny+1));
+fnS(1:nx,1:ny+1) = DnS(1:nx,1:ny+1).*(u(2:nx+1,2:ny+2)...
+                   -u(2:nx+1,1:ny+1));
+
+% Compute the divergence of the fluxes and add reaction 
+% term:
+operatorResult(1:nx,1:ny) =...
+                 -(feW(2:nx+1,1:ny)-feW(1:nx,1:ny)...
+                 +fnS(1:nx,2:ny+1)-fnS(1:nx,1:ny))/hf2...
+                 +C.*u(2:nx+1,2:ny+1);
+
+end--------------
+<MGOperator.m>
+function u = MGOperator(level,f,DeW,DnS,C,u,hf,MGParam)
+
+% Pre-smoothing
+% u = smoothQJacDamped(f,DeW,DnS,C,u,hf,MGParam.m1,...
+%                      MGParam.omega);
+
+% Alternative pre-smoothing option:
+u = mex_smoothQGSDamped(f,DeW,DnS,C,u,hf,MGParam.m1,...
+                    MGParam.omega,'fwd');
+
+if level > 0
+  hc = 2*hf;
+  nfPlusGhost = size(u);
+  nf = nfPlusGhost-2;
+
+  % Coarse grid interior dimensions are [nc(1),nc(2)].
+  nc = nf/2;
+
+  % Compute the residual and restric to the coarse grid.
+  cGr = restriction(getResidual(u,f,DeW,DnS,C,hf));
+    
+  % Restrict the diffusion coefficients to the coarse 
+  % grid.
+  [cDeW,cDnS] = restrictDiff(DeW,DnS);
+  
+  % Restrict the reaction coefficient to the coarse grid.
+  cC = restriction(C);
+    
+  % Approximate on the coarse grid using recursive MG.
+  cGc = zeros(nc(1)+2,nc(2)+2);
+  for s = 1:MGParam.pCycle
+    cGc =...
+        MGOperator(level-1,cGr,cDeW,cDnS,cC,cGc,hc,MGParam);
+  end
+
+  % Prolongate the coarse grid correction and update the
+  % fine grid approximation.
+  u(2:nf(1)+1,2:nf(2)+1) = u(2:nf(1)+1,2:nf(2)+1)...
+                 +prolongation(cGc(2:nc(1)+1,2:nc(2)+1));
+    
+  % Post-smoothing.
+  % u = smoothQJacDamped(f,DeW,DnS,C,u,hf,MGParam.m2,...
+  %                      MGParam.omega);
+
+  % Alternative post-smoothing option:
+  u = mex_smoothQGSDamped(f,DeW,DnS,C,u,hf,MGParam.m2,...
+                      MGParam.omega,'bwd');
+end
+
+end--------------
+<Testing.m>
+% RunGlobal_Save.m
+% Runs the original Global Solver with the specific test case parameters
+% and saves the result for consistency checking.
+%
+% COMPATIBILITY NOTE: This script is designed for the ORIGINAL library
+% (8 arguments, uExact required).
+
+clear; clc;
+
+%% 1. Simulation Parameters
+L = 12; 
+nL = [2^L, 2^L]; 
+N = nL(1);
+
+xyLower = [-2.0, -2.0];
+xyUpper = [ 2.0,  2.0];
+hMesh = (xyUpper(1) - xyLower(1)) / nL(1);
+
+% Problem Parameters (Specific Test Case)
+epsilon = 0.05; 
+alpha   = 3.0;
+beta    = 2.0;
+gamma   = 1.0;
+kappa   = 0.01;
+
+% Multigrid Parameters
+MGParam.nL     = nL;
+MGParam.xLower = xyLower;
+MGParam.xUpper = xyUpper;
+MGParam.L      = L;
+MGParam.pCycle = 1; MGParam.m1 = 3; MGParam.m2 = 3;      
+MGParam.omega  = 0.66; MGParam.kMax = 100; MGParam.tol = 1.0e-12;
+
+fprintf('Running Global Solver (N=%d)...\n', N);
+
+%% 2. Grid Setup
+xCenter = linspace(xyLower(1) + hMesh/2, xyUpper(1) - hMesh/2, nL(1));
+yCenter = linspace(xyLower(2) + hMesh/2, xyUpper(2) - hMesh/2, nL(2));
+[XCC, YCC] = ndgrid(xCenter, yCenter);
+
+xEdgePts = linspace(xyLower(1), xyUpper(1), nL(1)+1);
+yEdgePts = linspace(xyLower(2), xyUpper(2), nL(2)+1);
+
+[XEW, YEW] = ndgrid(xEdgePts, yCenter);
+[XNS, YNS] = ndgrid(xCenter, yEdgePts);
+
+%% 3. Geometry
+[polyX, polyY] = generateBoundary(2000);
+distCenter = computeSignedDistance(XCC, YCC, polyX, polyY, hMesh);
+distEW = computeSignedDistance(XEW, YEW, polyX, polyY, hMesh);
+distNS = computeSignedDistance(XNS, YNS, polyX, polyY, hMesh);
+
+%% 4. Compute Coefficients (Exact Match to Test Case)
+% Phase Field
+argEW = distEW ./ epsilon; phiEW = 0.5 .* (1.0 + tanh(argEW));
+diffCoefEW = alpha + (1.0 - alpha) .* phiEW;
+
+argNS = distNS ./ epsilon; phiNS = 0.5 .* (1.0 + tanh(argNS));
+diffCoefNS = alpha + (1.0 - alpha) .* phiNS;
+
+argCC = distCenter ./ epsilon;
+phiCC = 0.5 .* (1.0 + tanh(argCC));
+absGradPhi = (1.0 / (2.0 * epsilon)) .* (sech(argCC).^2);
+
+% Reaction
+cEps = beta .* (1.0 - phiCC) + gamma .* phiCC;
+reacCoef = cEps + kappa .* absGradPhi;
+
+% Forcing Terms (Test Case Specifics)
+qFunc = -XCC.^2 + 15.0;
+hFunc = 2.5*sin(XCC)+exp(cos(YCC));
+fEps = hFunc .* (1.0 - phiCC) + qFunc .* phiCC;
+
+gFunc = XCC - XCC + 4; % Effectively 4.0
+rhsVector = fEps - gFunc .* absGradPhi;
+
+%% 5. Run Solver
+uInit = zeros(nL(1)+2, nL(2)+2);
+
+% DUMMY UREF: The old library requires the 8th argument to calculate error.
+% We pass a zero matrix so it doesn't crash (error calculation will be junk but we ignore it).
+uRefDummy = zeros(nL(1)+2, nL(2)+2);
+
+% Call with 8 arguments (Old Signature)
+[uSol, ~, ~] = multiGridSolver(uInit, rhsVector, diffCoefEW, ...
+                               diffCoefNS, reacCoef, hMesh, MGParam, uRefDummy);
+
+uInterior = uSol(2:end-1, 2:end-1);
+
+%% 6. Save Data
+save('GlobalSolution.mat', 'uInterior', 'xCenter', 'yCenter', 'hMesh', 'N');
+fprintf('Saved Global solution to GlobalSolution.mat\n');--------------
+<applyBCs.m>
+function u = applyBCs(u)
+
+nfPlusGhostLayers = size(u);
+nf = nfPlusGhostLayers-2;
+
+% Homogeneous Dirichlet BC:
+
+% u(2:nf(1)+1,        1) = -u(2:nf(1)+1,        2);
+% u(2:nf(1)+1,  nf(2)+2) = -u(2:nf(1)+1,  nf(2)+1);
+% u(        1,1:nf(2)+2) = -u(        2,1:nf(2)+2);
+% u(  nf(1)+2,1:nf(2)+2) = -u(  nf(1)+1,1:nf(2)+2);
+
+% Homogeneous Neumann BC:
+
+u(2:nf(1)+1,        1) = u(2:nf(1)+1,        2);
+u(2:nf(1)+1,  nf(2)+2) = u(2:nf(1)+1,  nf(2)+1);
+u(        1,1:nf(2)+2) = u(        2,1:nf(2)+2);
+u(  nf(1)+2,1:nf(2)+2) = u(  nf(1)+1,1:nf(2)+2);
+
+% Periodic BC:
+
+% u(2:nf(1)+1,        1) = u(2:nf(1)+1,  nf(2)+1);
+% u(2:nf(1)+1,  nf(2)+2) = u(2:nf(1)+1,        2);
+% u(        1,1:nf(2)+2) = u(  nf(1)+1,1:nf(2)+2);
+% u(  nf(1)+2,1:nf(2)+2) = u(        2,1:nf(2)+2);
+
+end--------------
+<computeSignedDistance.m>
+function phi = computeSignedDistance(X, Y, polyX, polyY, h)
+    
+    % Ensure polygon is closed
+    if polyX(1) ~= polyX(end) || polyY(1) ~= polyY(end)
+        polyX(end+1) = polyX(1);
+        polyY(end+1) = polyY(1);
+    end
+
+    % Call C++ FMM
+    phi = mex_computeSignedDistance(X, Y, polyX, polyY, h);
+
+end--------------
+<computeSignedDistance_MATLAB.m>
+function phi = computeSignedDistance_MATLAB(X, Y, polyX, polyY, h)
+% computeSignedDistance_MATLAB
+% A Pure MATLAB implementation of the Fast Marching Method for benchmarking.
+%
+% Inputs: X, Y (Meshgrids), polyX, polyY (Boundary points), h (Grid spacing)
+% Output: Signed Distance Function phi
+
+    [nx, ny] = size(X);
+    
+    % Constants
+    INF_VAL = 1e10; % Large number acting as infinity
+    KNOWN = 2;
+    TRIAL = 1;
+    FAR   = 0;
+    
+    % Initialize arrays
+    phi = ones(nx, ny) * INF_VAL;
+    status = zeros(nx, ny); % 0=Far, 1=Trial, 2=Known
+    
+    % ---------------------------------------------------------
+    % 1. Initialization (Exact Distance to Segments)
+    % ---------------------------------------------------------
+    % We assume polyX, polyY are dense enough or we check bounding boxes.
+    % For MATLAB performance, we vectorize the segment check.
+    
+    bandWidth = 2.5 * h;
+    bandWidthSq = bandWidth^2;
+    
+    % Ensure closed polygon
+    if polyX(1) ~= polyX(end) || polyY(1) ~= polyY(end)
+        polyX(end+1) = polyX(1);
+        polyY(end+1) = polyY(1);
+    end
+    
+    numSegs = length(polyX)-1;
+    
+    % We will create a mask of points to update to avoid looping every pixel
+    % for every segment.
+    
+    for k = 1:numSegs
+        p1 = [polyX(k), polyY(k)];
+        p2 = [polyX(k+1), polyY(k+1)];
+        
+        % Bounding box of segment + band
+        min_x = min(p1(1), p2(1)) - bandWidth;
+        max_x = max(p1(1), p2(1)) + bandWidth;
+        min_y = min(p1(2), p2(2)) - bandWidth;
+        max_y = max(p1(2), p2(2)) + bandWidth;
+        
+        % Find indices (assuming uniform grid structure for speed)
+        % This is faster than find(X > ...)
+        j_min = find(Y(1,:) >= min_y, 1, 'first');
+        j_max = find(Y(1,:) <= max_y, 1, 'last');
+        i_min = find(X(:,1) >= min_x, 1, 'first');
+        i_max = find(X(:,1) <= max_x, 1, 'last');
+        
+        if isempty(i_min) || isempty(j_min), continue; end
+        
+        % Extract local grid patch
+        localX = X(i_min:i_max, j_min:j_max);
+        localY = Y(i_min:i_max, j_min:j_max);
+        
+        % Vectorized Point-Segment Distance
+        v = p2 - p1;
+        len_sq = sum(v.^2);
+        
+        if len_sq == 0
+            t = zeros(size(localX));
+        else
+            % Dot product projection
+            t = ((localX - p1(1))*v(1) + (localY - p1(2))*v(2)) / len_sq;
+            t = max(0, min(1, t));
+        end
+        
+        projX = p1(1) + t*v(1);
+        projY = p1(2) + t*v(2);
+        
+        d2 = (localX - projX).^2 + (localY - projY).^2;
+        
+        % Update phi
+        mask = d2 < bandWidthSq;
+        
+        % Get current values in this patch
+        currentPhiPatch = phi(i_min:i_max, j_min:j_max);
+        distPatch = sqrt(d2);
+        
+        % Update min
+        updateMask = mask & (distPatch < currentPhiPatch);
+        currentPhiPatch(updateMask) = distPatch(updateMask);
+        
+        phi(i_min:i_max, j_min:j_max) = currentPhiPatch;
+    end
+    
+    % ---------------------------------------------------------
+    % 2. Build Initial Trial Set
+    % ---------------------------------------------------------
+    % In MATLAB, using a linear array for indices is faster than x,y loops
+    
+    % Identify points initialized in step 1
+    initializedMask = phi < bandWidth;
+    
+    % Mark these as Known? No, usually boundaries are marked known, 
+    % neighbors are trial. Here we adopt the strategy:
+    % Fixed values are Known. Neighbors are Trial.
+    
+    [rows, cols] = find(initializedMask);
+    linIdxs = sub2ind([nx, ny], rows, cols);
+    
+    % Set initial known
+    status(linIdxs) = KNOWN;
+    
+    % Lists for Trial Set (Using vectors instead of Heap for MATLAB simplicity)
+    trialVal = [];
+    trialIdx = [];
+    
+    % Add neighbors of Known points to Trial
+    % Offsets: N, S, E, W
+    offsets = [-1, 1, -nx, nx];
+    
+    % Loop over known points to find initial trials
+    % (Vectorizing this logic is messy, doing a quick pass)
+    for k = 1:length(linIdxs)
+        curr = linIdxs(k);
+        [r, c] = ind2sub([nx, ny], curr);
+        
+        neighbors = [];
+        if r > 1,  neighbors(end+1) = curr - 1; end
+        if r < nx, neighbors(end+1) = curr + 1; end
+        if c > 1,  neighbors(end+1) = curr - nx; end
+        if c < ny, neighbors(end+1) = curr + nx; end
+        
+        for nb = neighbors
+            if status(nb) == FAR
+                status(nb) = TRIAL;
+                val = solveUpwind(nb, phi, status, h, nx);
+                phi(nb) = val;
+                trialIdx(end+1) = nb; 
+                trialVal(end+1) = val;
+            elseif status(nb) == TRIAL
+                 val = solveUpwind(nb, phi, status, h, nx);
+                 if val < phi(nb)
+                     phi(nb) = val;
+                     % Update value in list
+                     mask = (trialIdx == nb);
+                     trialVal(mask) = val;
+                 end
+            end
+        end
+    end
+    
+    % ---------------------------------------------------------
+    % 3. Fast Marching Loop
+    % ---------------------------------------------------------
+    % Using standard array operations (O(N) search) which simulates 
+    % why pure MATLAB is slow for FMM compared to C++ Heaps.
+    
+    while ~isempty(trialVal)
+        % Find min (Bottleneck in MATLAB without a Heap class)
+        [~, minLoc] = min(trialVal);
+        currentIdx = trialIdx(minLoc);
+        
+        % Remove from lists
+        trialIdx(minLoc) = [];
+        trialVal(minLoc) = [];
+        
+        if status(currentIdx) == KNOWN
+            continue;
+        end
+        
+        status(currentIdx) = KNOWN;
+        
+        % Update Neighbors
+        [r, c] = ind2sub([nx, ny], currentIdx);
+        
+        neighbors = [];
+        if r > 1,  neighbors(end+1) = currentIdx - 1; end
+        if r < nx, neighbors(end+1) = currentIdx + 1; end
+        if c > 1,  neighbors(end+1) = currentIdx - nx; end
+        if c < ny, neighbors(end+1) = currentIdx + nx; end
+        
+        for nb = neighbors
+            if status(nb) ~= KNOWN
+                newVal = solveUpwind(nb, phi, status, h, nx);
+                
+                if status(nb) == FAR
+                    status(nb) = TRIAL;
+                    phi(nb) = newVal;
+                    trialIdx(end+1) = nb;
+                    trialVal(end+1) = newVal;
+                elseif status(nb) == TRIAL
+                    if newVal < phi(nb)
+                        phi(nb) = newVal;
+                        mask = (trialIdx == nb);
+                        trialVal(mask) = newVal;
+                    end
+                end
+            end
+        end
+    end
+    
+    % ---------------------------------------------------------
+    % 4. Apply Sign
+    % ---------------------------------------------------------
+    inMask = inpolygon(X, Y, polyX, polyY);
+    phi(~inMask) = -phi(~inMask);
+
+end
+
+function val = solveUpwind(idx, phi, status, h, nx)
+    % Convert linear index to subscript
+    % We assume column-major (standard MATLAB)
+    r = mod(idx-1, nx) + 1;
+    c = floor((idx-1)/nx) + 1;
+    
+    INF_VAL = 1e10;
+    
+    % Get neighbors (Up, Down, Left, Right)
+    % Values
+    a = INF_VAL; % Min of Horizontal
+    b = INF_VAL; % Min of Vertical
+    
+    % Check Row Neighbors
+    if r > 1 && status(idx-1) == 2
+        a = min(a, phi(idx-1));
+    end
+    if r < nx && status(idx+1) == 2
+        a = min(a, min(a, phi(idx+1)));
+    end
+    
+    % Check Col Neighbors
+    if c > 1 && status(idx-nx) == 2
+        b = min(b, phi(idx-nx));
+    end
+    if (idx+nx) <= numel(phi) && status(idx+nx) == 2 % Bound check for safety
+        b = min(b, min(b, phi(idx+nx)));
+    end
+    
+    % Solve Quadratic
+    if a == INF_VAL && b == INF_VAL
+        val = INF_VAL;
+    elseif a == INF_VAL
+        val = b + h;
+    elseif b == INF_VAL
+        val = a + h;
+    else
+        d = abs(a - b);
+        if d >= h
+            val = min(a, b) + h;
+        else
+            val = 0.5 * (a + b + sqrt(2*h^2 - d^2));
+        end
+    end
+end--------------
+<elliptic2DMGCCDiff.m>
+%
+%   Elliptic2DMGCCDiff.m
+%
+%   Solves a 2D Diffuse Domain Method (DDM) approximation for a two-sided
+%   problem with transmission-type boundary conditions on a complex interface.
+%
+%   -----------------------------------------------------------------------
+%   1. GENERIC SOLVER FORMULATION
+%   -----------------------------------------------------------------------
+%   The underlying Multigrid solver targets the generic linear elliptic PDE:
+%
+%       - div( D(x) * grad(u) ) + C(x) * u = F(x)    in Omega
+%
+%   -----------------------------------------------------------------------
+%   2. DDM FORMULATION
+%   -----------------------------------------------------------------------
+%   The DDM approximates the interface problem by introducing a phase-field
+%   function phi and reformulating the equation on a regular domain:
+%
+%       - div( D_eps * grad(u) ) + c_eps * u + (kappa * u + g) * |grad(phi)| = f_eps
+%
+%   Where:
+%       D_eps = alpha + (1 - alpha) * phi
+%       c_eps = beta * (1 - phi) + gamma * phi
+%       f_eps = h * (1 - phi) + q * phi
+%       |grad(phi)| approx (1 / 2*eps) * sech^2(dist / eps)
+%
+%   -----------------------------------------------------------------------
+%   3. ALGEBRAIC REARRANGEMENT
+%   -----------------------------------------------------------------------
+%   To map the DDM equation into the generic solver form, the boundary
+%   source terms associated with the interface delta function (|grad(phi)|)
+%   are distributed as follows:
+%
+%   A. The linear term (kappa * u * |grad(phi)|) is absorbed into the
+%      reaction coefficient C(x).
+%   B. The source term (g * |grad(phi)|) is moved to the RHS forcing F(x).
+%
+%   Effective Solver Coefficients:
+%       D(x) = D_eps
+%       C(x) = c_eps + kappa * |grad(phi)|
+%       F(x) = f_eps - g * |grad(phi)|
+%
+
+clear; clc;
+
+%% 1. Simulation Parameters
+
+% Grid Resolution
+L = 10; 
+nL = [2^L, 2^L]; 
+
+% Box Domain
+xyLower = [-2.0, -2.0];
+xyUpper = [ 2.0,  2.0];
+
+hMesh = (xyUpper(1) - xyLower(1)) / nL(1);
+
+% Problem Parameters (PDF Eq 4.6)
+epsilon = 0.05; 
+alpha   = 3.0;
+beta    = 2.0;
+gamma   = 1.0;
+kappa   = 0.01;
+
+% Check if the level is smaller than or equal to 13
+if L > 13
+    error("The grid is too fine.")
+end
+
+% Multigrid Parameters
+MGParam.nL     = nL;
+MGParam.xLower = xyLower;
+MGParam.xUpper = xyUpper;
+MGParam.L      = L;
+MGParam.pCycle = 1;      
+MGParam.m1     = 3;      
+MGParam.m2     = 3;      
+MGParam.omega  = 0.66;    
+MGParam.kMax   = 100;
+MGParam.tol    = 1.0e-12;
+
+%% 2. Grid Setup
+
+xCenter = linspace(xyLower(1) + hMesh/2, xyUpper(1) - hMesh/2, nL(1));
+yCenter = linspace(xyLower(2) + hMesh/2, xyUpper(2) - hMesh/2, nL(2));
+[XCC, YCC] = ndgrid(xCenter, yCenter);
+
+xEdgePts = linspace(xyLower(1), xyUpper(1), nL(1)+1);
+yEdgePts = linspace(xyLower(2), xyUpper(2), nL(2)+1);
+
+[XEW, YEW] = ndgrid(xEdgePts, yCenter);
+[XNS, YNS] = ndgrid(xCenter, yEdgePts);
+
+%% 3. Geometry and Distance Function (Interactive Loading)
+
+% Changed filename to avoid conflict with Starfish data
+sdfFileName = sprintf('SDF_Data_N%d.mat', nL(1));
+dataLoaded = false;
+
+if exist(sdfFileName, 'file')
+    msg = sprintf('Found existing SDF data "%s". Load it? [y/n]: ', sdfFileName);
+    userResp = input(msg, 's');
+    if strcmpi(userResp, 'y')
+        fprintf('Loading SDF data from file...\n');
+        load(sdfFileName, 'distCenter', 'distEW', 'distNS', 'polyX', 'polyY');
+        dataLoaded = true;
+    end
+end
+
+if ~dataLoaded
+    fprintf('Generating Boundary (Ellipse)...\n');
+    [polyX, polyY] = generateBoundary(3000);
+    
+    fprintf('Computing Signed Distance Function (Fast Marching)...\n');
+    distCenter = computeSignedDistance(XCC, YCC, polyX, polyY, hMesh);
+    distEW = computeSignedDistance(XEW, YEW, polyX, polyY, hMesh);
+    distNS = computeSignedDistance(XNS, YNS, polyX, polyY, hMesh);
+    
+    fprintf('Saving SDF data to "%s"...\n', sdfFileName);
+    save(sdfFileName, 'distCenter', 'distEW', 'distNS', 'polyX', 'polyY');
+end
+
+%% 4. Construct Analytical Solution (u_0) for Error Calculation
+
+fprintf('Constructing Analytical Solution u_0...\n');
+
+% Equation (4.5):
+% u1 = -x1^2 - 4x2^2 + 6   (Inside: x1^2 + 4x2^2 < 4)
+% u2 = 2                   (Outside)
+
+uRefInterior = zeros(nL(1), nL(2));
+
+% Check ellipse condition: x^2 + 4y^2 < 4
+% Note: distCenter > 0 is inside, but using coordinate check is exact.
+isInside = (XCC.^2 + 4*YCC.^2) < 4;
+
+uRefInterior(isInside)  = -XCC(isInside).^2 - 4*YCC(isInside).^2 + 6;
+uRefInterior(~isInside) = 2.0;
+
+% Fill uRef with ghost layers (Neumann BCs for consistency in plotting/norm)
+uRef = zeros(nL(1)+2, nL(2)+2);
+uRef(2:end-1, 2:end-1) = uRefInterior;
+uRef = applyBCs(uRef);
+hasRef = true;
+
+%% 5. Pre-Compute Coefficients
+
+fprintf('Computing DDM Coefficients...\n');
+
+% --- Phase Field Arrays ---
+argEW = distEW ./ epsilon;
+phiEW = 0.5 .* (1.0 + tanh(argEW));
+diffCoefEW = alpha + (1.0 - alpha) .* phiEW;
+
+argNS = distNS ./ epsilon;
+phiNS = 0.5 .* (1.0 + tanh(argNS));
+diffCoefNS = alpha + (1.0 - alpha) .* phiNS;
+
+argCC = distCenter ./ epsilon;
+phiCC = 0.5 .* (1.0 + tanh(argCC));
+
+% Gradient Magnitude
+absGradPhi = (1.0 / (2.0 * epsilon)) .* (sech(argCC).^2);
+
+% Reaction: C = c_eps + kappa * |grad phi|
+cEps = beta .* (1.0 - phiCC) + gamma .* phiCC;
+reacCoef = cEps + kappa .* absGradPhi;
+
+% --- Forcing Terms (Eq 4.7) ---
+% q(x) = -x1^2 - 4x2^2 + 16
+qFunc = -XCC.^2 + 15.0;
+% h(x) = 2
+hFunc = 2.5*sin(XCC)+exp(cos(YCC));
+
+fEps = hFunc .* (1.0 - phiCC) + qFunc .* phiCC;
+
+% --- Boundary Forcing g(x) (Eq 4.8) ---
+% g(x) = x1^2 + 4x2^2 - 6 + 2*sqrt(x1^2 + 16x2^2)
+gFunc = XCC - XCC + 4;
+
+% Total RHS = f_eps - g(x) * |grad phi|
+rhsVector = fEps - gFunc .* absGradPhi;
+
+%% 6. Run Multigrid Solver
+
+fprintf('Starting Multigrid Solver (N=%dx%d)...\n', nL(1), nL(2));
+
+uInit = zeros(nL(1)+2, nL(2)+2);
+
+tic;
+% We pass uRef so the solver calculates ||u_k - u_0|| at every step
+[uSol, errVals, kStop] = multiGridSolver(uInit, rhsVector, diffCoefEW, ...
+                                         diffCoefNS, reacCoef, hMesh, ...
+                                         MGParam, uRef);
+solveTime = toc;
+
+fprintf('Solver converged in %d iterations (%.4f seconds).\n', kStop, solveTime);
+
+% Calculate final L2 error against analytical u0
+uInterior = uSol(2:end-1, 2:end-1);
+diff = uInterior - uRefInterior;
+finalL2Err = sqrt(sum(diff(:).^2) / numel(diff));
+fprintf('Final L2 Error ||u_eps - u_0|| = %.4e\n', finalL2Err);
+
+%% 7. Plotting
+
+% --- Figure 1: 3D Solution Surface ---
+figure(1); clf;
+set(gcf, 'Name', 'DDM Solution 3D', 'Color', 'w');
+
+% Use surf for 3D visualization
+surf(XCC, YCC, uInterior, 'EdgeColor', 'none', 'FaceColor', 'interp');
+hold on;
+
+% Interpolate solution onto the boundary curve to plot the interface in 3D
+F_interp = griddedInterpolant(XCC, YCC, uInterior, 'linear', 'none');
+u_on_boundary = F_interp(polyX, polyY);
+
+% Plot boundary curve slightly lifted to prevent Z-fighting
+plot3(polyX, polyY, u_on_boundary + 0.05, 'r-', 'LineWidth', 3);
+hold off;
+
+% Visual settings
+axis tight;
+view(-45, 30); 
+colormap('jet');
+colorbar;
+camlight('headlight'); lighting phong; material dull;
+
+title(['DDM Solution u_\epsilon (\epsilon = ' num2str(epsilon) ')'], 'FontSize', 14);
+xlabel('x_1', 'FontSize', 12); 
+ylabel('x_2', 'FontSize', 12);
+zlabel('u', 'FontSize', 12);
+set(gca, 'FontSize', 12);
+rotate3d on;
+
+% --- Figure 2: Convergence History ---
+figure(2); clf;
+set(gcf, 'Name', 'Convergence History', 'Color', 'w');
+
+% Plot Norms
+semilogy(1:kStop, errVals(1:kStop, 1), 'k-o', 'LineWidth', 1.2, 'MarkerSize', 6);
+hold on;
+semilogy(1:kStop, errVals(1:kStop, 2), 'r-s', 'LineWidth', 1.2, 'MarkerSize', 6);
+
+legendLabels = {'Residual Norm $||r_k||$', 'Correction Norm $||u_k - u_{k-1}||$'};
+
+if hasRef
+    semilogy(1:kStop, errVals(1:kStop, 3), 'b-d', 'LineWidth', 1.2, 'MarkerSize', 6);
+    legendLabels{end+1} = 'Analytic Error $||u_k - u_0||$';
+end
+
+% --- Log-Linear Fit for Correction Norm ---
+gamma_comp = 0;
+if kStop >= 4
+    fitRange = kStop-3:kStop;
+    yData = log(errVals(fitRange, 2));
+    xData = fitRange';
+    
+    p = polyfit(xData, yData, 1);
+    gamma_comp = exp(p(1));
+    
+    xFit = (kStop-4):kStop;
+    yFit = exp(polyval(p, xFit));
+    
+    plot(xFit, yFit, 'g--', 'LineWidth', 2.0);
+    legendLabels{end+1} = 'Log-Linear Fit';
+    
+    txtStr = sprintf('$\\gamma_{\\rm comp} = %.4f$', gamma_comp);
+    text(kStop - 0.5, errVals(kStop, 2) * 2, txtStr, ...
+         'Interpreter', 'latex', 'FontSize', 14, ...
+         'HorizontalAlignment', 'right', 'VerticalAlignment', 'bottom', ...
+         'BackgroundColor', 'w', 'EdgeColor', 'k');
+end
+
+grid on;
+legend(legendLabels, 'Location', 'NorthEast', 'Interpreter', 'latex', 'FontSize', 12);
+title('Multigrid Convergence History', 'FontSize', 14);
+xlabel('Iteration $k$', 'Interpreter', 'latex', 'FontSize', 12); 
+ylabel('Norm', 'Interpreter', 'latex', 'FontSize', 12);
+set(gca, 'FontSize', 12);--------------
+<generateBoundary.m>
+function [x, y] = generateBoundary(n)
+    % Generates boundary coordinates for the interface.
+    
+    theta = linspace(0, 2*pi, n);
+
+    % --- Case 1: Ellipse (PDF Section 4.2, First Example) ---
+    % Ellipse: x^2 + 4y^2 = 4  =>  (x/2)^2 + (y/1)^2 = 1
+    % Semi-major axis a=2, Semi-minor axis b=1
+    
+    % x = 2.0 * cos(theta);
+    % y = 1.0 * sin(theta);
+    
+    % --- Case 2: Starfish (PDF Section 4.2, Equation 4.9) ---
+    % r(theta) = 0.9 * (1.2 + 0.7 * sin(5*theta))
+    % This tests the solver on non-convex geometries.
+    
+    r = 0.9 * (1.2 + 0.7 * sin(5 * theta));
+    
+    x = r .* cos(theta);
+    y = r .* sin(theta);
+end--------------
+<getResidual.m>
+function residualResult = getResidual(u,f,DeW,DnS,C,hf)
+
+% Apply the boundary conditions
+u = applyBCs(u);
+
+residualResult = f-FDOperator(u,DeW,DnS,C,hf);
+
+end--------------
+<multiGridSolver.m>
+function [u,errVals,kStop] =...
+          multiGridSolver(u0,f,DeW,DnS,C,hf,MGParam,uExact)
+
+nf = size(f);
+k = 0;
+errorVal = MGParam.tol+1.0;
+errVals = zeros(MGParam.kMax,3);
+
+uo = u0;
+
+while ((k < MGParam.kMax) && (errorVal > MGParam.tol))
+
+  % Apply one multigrid cycle.
+  u = MGOperator(MGParam.L,f,DeW,DnS,C,uo,hf,MGParam);
+
+  % Evaluate various norms.
+  residErr =...
+            normScaledL2(getResidual(u,f,DeW,DnS,C,hf));
+  correErr = normScaledL2(uo(2:nf(1)+1,2:nf(2)+1)...
+                          -u(2:nf(1)+1,2:nf(2)+1));
+  exactErr = normScaledL2(uExact(2:nf(1)+1,2:nf(2)+1)...
+                          -u(2:nf(1)+1,2:nf(2)+1));
+
+  k = k+1;
+  errVals(k,1) = residErr;
+  errVals(k,2) = correErr;
+  errVals(k,3) = exactErr;
+
+  fprintf('Multigrid iteration %d:\n', k);
+  fprintf('  residual   = %.6e\n', residErr);
+  fprintf('  correction = %.6e\n', correErr);
+  fprintf('  true error = %.6e\n', exactErr);
+
+  % Stopping criterion.
+  errorVal = correErr;  
+  uo = u;
+end
+
+kStop = k;
+
+end--------------
+<normScaledL2.m>
+function normResult = normScaledL2(u)
+
+nf = size(u);
+normResult = sqrt(sum(sum(u.*u))/(nf(1)*nf(2)));
+
+end--------------
+<prolongation.m>
+function presult = prolongation(u)
+
+nc = size(u);
+nf = nc*2;
+presult = zeros(nf);
+
+presult(2:2:nf(1)  ,2:2:nf(2)  ) = u(1:nc(1),1:nc(2));
+presult(1:2:nf(1)-1,2:2:nf(2)  ) = u(1:nc(1),1:nc(2));
+presult(2:2:nf(1)  ,1:2:nf(2)-1) = u(1:nc(1),1:nc(2));
+presult(1:2:nf(1)-1,1:2:nf(2)-1) = u(1:nc(1),1:nc(2));
+
+end--------------
+<restrictDiff.m>
+function [cDeW,cDnS] = restrictDiff(DeW,DnS)
+
+[nxEW,ny] = size(DeW);
+[nx,nyNS] = size(DnS);
+
+ncx = nx/2;  
+ncy = ny/2;
+
+cDeW(1:ncx+1,1:ncy) =...
+       0.5*(DeW(1:2:nx+1,1:2:ny-1)+DeW(1:2:nx+1,2:2:ny));
+
+cDnS(1:ncx,1:ncy+1) =...
+       0.5*(DnS(1:2:nx-1,1:2:ny+1)+DnS(2:2:nx,1:2:ny+1));
+
+end--------------
+<restriction.m>
+function restrictionResult = restriction(u)
+
+nf = size(u);
+nc = nf/2;
+restrictionResult...
+  = 0.25*(u(1:2:nf(1)-1,1:2:nf(2)-1)...
+    +     u(2:2:nf(1)  ,1:2:nf(2)-1)...
+    +     u(1:2:nf(1)-1,2:2:nf(2)  )...
+    +     u(2:2:nf(1)  ,2:2:nf(2)  ));
+
+end--------------
+<smoothQGSDamped.m>
+function u = smoothQGSDamped(f,DeW,DnS,C,u,hf,m,...
+  omega,sweepDirection)
+
+nfPlusGhostLayers = size(u);
+nf = nfPlusGhostLayers-2;
+
+hf2 = hf*hf;
+omegaPrime = 1.0-omega;
+
+switch sweepDirection
+  case 'fwd'
+    xSweepIndex = [1:nf(1)];
+    ySweepIndex = [1:nf(2)];
+  otherwise
+    xSweepIndex = [nf(1):-1:1];
+    ySweepIndex = [nf(2):-1:1];
+end
+
+u = applyBCs(u);
+
+for sweep = 1:m
+  for j = ySweepIndex
+    for i = xSweepIndex
+
+      tmp = (hf2*f(i,j)...
+            +u(i+2,j+1)*DeW(i+1,j  )...
+            +u(i  ,j+1)*DeW(i  ,j  )...
+            +u(i+1,j+2)*DnS(i  ,j+1)...
+            +u(i+1,j  )*DnS(i  ,j  ))...
+            /(DeW(i+1,j)+DeW(i,j)+DnS(i,j+1)+DnS(i,j)...
+            +C(i,j)*hf2);
+      u(i+1,j+1) = omega*tmp+omegaPrime*u(i+1,j+1);
+
+    end
+  end
+  
+  u = applyBCs(u);
+
+end
+
+end--------------
+<smoothQJacDamped.m>
+function u = smoothQJacDamped(f,DeW,DnS,C,u,hf,m,omega)
+
+nfPlusGhostLayers = size(u);
+nf = nfPlusGhostLayers-2;
+
+z = zeros(nf(1),nf(2));
+
+hf2 = hf*hf;
+omegaPrime = 1.0-omega;
+
+u = applyBCs(u);
+
+for sweep = 1:m
+  for j = 1:nf(2)
+    for i = 1:nf(1)
+
+      z(i,j) = (hf2*f(i,j)...
+               +u(i+2,j+1)*DeW(i+1,j  )...
+               +u(i  ,j+1)*DeW(i  ,j  )...
+               +u(i+1,j+2)*DnS(i  ,j+1)...
+               +u(i+1,j  )*DnS(i  ,j  ))...
+               /(DeW(i+1,j)+DeW(i,j)+DnS(i,j+1)...
+               +DnS(i,j)+ C(i,j)*hf2);
+
+    end
+  end
+
+  u(2:nf(1)+1,2:nf(2)+1) = omega*z(1:nf(1),1:nf(2))...
+    + omegaPrime*u(2:nf(1)+1,2:nf(2)+1);
+  u = applyBCs(u);
+
+end
+
+end--------------

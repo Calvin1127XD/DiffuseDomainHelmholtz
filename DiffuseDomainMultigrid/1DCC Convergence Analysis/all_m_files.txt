@@ -1,0 +1,655 @@
+<DDMSolver1DOneSided.m>
+%
+%   DDMSolver1D_OneSided.m
+%
+%   Reproduces the "One-Sided Problem" experiment shown in Figure 5.1 
+%   of the PDF.
+%
+%   Problem:
+%   Left Domain (-1, 0): u_L = 6  (Constant)
+%   Right Domain (0, 1): u_R = (4x^2 - 8x + 6)cos(4pi x)
+%
+%   Parameters from Eqs (5.2)-(5.4) and Figure 5.1 Caption:
+%   alpha = 0.01, beta = 0, gamma = 1, kappa = 1.6
+%   epsilon = 0.05 (as per Figure 5.1 caption)
+%
+
+clear; clc;
+
+%% 1. Simulation Parameters
+
+% N = 2^15 = 32768 (As described in the text for this experiment)
+numLevels = 15; 
+numCells  = 2^numLevels;
+
+% Domain
+xLower = -1.0;
+xUpper =  1.0;
+hMesh  = (xUpper - xLower) / numCells;
+
+% Problem Parameters
+epsilon = 0.0005;   % Matching Figure 5.1 caption
+alpha   = 0.01;   % Small alpha for one-sided approximation
+beta    = 0.0;    % No reaction in left domain
+gamma   = 1.0;
+kappa   = 1.6; 
+
+%% 2. Grid and Coordinate Setup
+
+xCenter = linspace(xLower + hMesh/2, xUpper - hMesh/2, numCells)';
+xEdge   = linspace(xLower, xUpper, numCells+1)';
+
+%% 3. Construct Sharp Interface Solution (uRef)
+% Exact solution u_0 defined in Eq (5.1)
+
+uRefCenter = zeros(numCells, 1);
+
+for i = 1:numCells
+    xVal = xCenter(i);
+    if xVal <= 0
+        % Left domain: u_L(x) = 6
+        uRefCenter(i) = 6.0;
+    else
+        % Right domain: u_R(x) = (4x^2 - 8x + 6)cos(4pi x)
+        uRefCenter(i) = (4 * xVal^2 - 8 * xVal + 6) * cos(4 * pi * xVal);
+    end
+end
+
+% Fill ghost layers for Neumann BCs
+uRef = zeros(numCells + 2, 1);
+uRef(2:numCells + 1) = uRefCenter;
+uRef = applyBCs(uRef);
+
+%% 4. Calculate Lambda Explicitly
+% The solver automatically derives lambda from the jump condition of uRef.
+% Condition: u'_R(0) - alpha*u'_L(0) = kappa*u(0) + lambda
+
+uZero       = 6.0;
+duLeftZero  = 0.0;   % Derivative of constant 6 is 0
+duRightZero = -8.0;  % Derivative of u_R at x=0
+
+% lambda = (Jump in Flux) - kappa * u(0)
+lambda = (duRightZero - alpha * duLeftZero) - kappa * uZero;
+% Expected: (-8 - 0.01*0) - 1.6*6 = -8 - 9.6 = -17.6
+
+fprintf('Calculated Lambda: %.4f (Expected -17.6)\n', lambda);
+
+%% 5. Pre-Compute Coefficient Arrays
+
+% --- Phase Field Computations ---
+argEdge = 3.0 * xEdge / epsilon;
+phiEdge = 0.5 * (1.0 + tanh(argEdge));
+
+argCenter = 3.0 * xCenter / epsilon;
+phiCenter = 0.5 * (1.0 + tanh(argCenter));
+phiPrimeCenter = (1.5 * sech(argCenter).^2) / epsilon;
+
+% --- Diffusion Coefficient D (at Edges) ---
+% D = alpha + (1-alpha)phi
+diffCoefEdge = alpha + (1.0 - alpha) * phiEdge;
+
+% --- Reaction Coefficient C (at Centers) ---
+% c_eps = beta(1-phi) + gamma*phi
+cEps = beta * (1.0 - phiCenter) + gamma * phiCenter;
+
+% Operator C = c_eps + kappa * phi'
+reacCoefCenter = cEps + kappa * phiPrimeCenter;
+
+% --- Forcing Functions h(x) and q(x) (at Centers) ---
+
+% h(x) = 0 (since beta=0 and u_L is constant)
+hFunc = zeros(numCells, 1);
+
+% q(x) defined in Eq (5.3)
+term1 = (1.0 - 4.0 * pi^2 * (2.0 * xCenter.^2 - 4.0 * xCenter + 3.0)) .* cos(4.0 * pi * xCenter);
+term2 = 8.0 * pi * (xCenter - 1.0) .* sin(4.0 * pi * xCenter);
+term3 = gamma * (4.0 * xCenter.^2 - 8.0 * xCenter + 6.0) .* cos(4.0 * pi * xCenter);
+qFunc = -8.0 * (term1 - term2) + term3;
+
+% f_eps = h(1-phi) + q*phi
+fEps = hFunc .* (1.0 - phiCenter) + qFunc .* phiCenter;
+
+% Total RHS Vector F = f_eps - lambda * phi'
+rhsVector = fEps - lambda * phiPrimeCenter;
+
+%% 6. Multigrid Configuration
+
+MGParam.nL     = numCells;
+MGParam.xLower = xLower;
+MGParam.xUpper = xUpper;
+MGParam.L      = numLevels;
+MGParam.pCycle = 1;       
+MGParam.m1     = 3;       
+MGParam.m2     = 3;       
+MGParam.omega  = 2/3;     
+MGParam.kMax   = 100;      
+MGParam.tol    = 1.0e-11; 
+MGParam.C      = reacCoefCenter; 
+
+uInit = zeros(numCells + 2, 1);
+
+%% 7. Run Solver
+
+fprintf('Starting Multigrid Solver with N = %d, epsilon = %.5f...\n', numCells, epsilon);
+tic;
+[uSol, errorHistory, iterStop] = multiGridSolver(uInit, rhsVector, diffCoefEdge, ...
+                                                 reacCoefCenter, hMesh, ...
+                                                 MGParam, uRef);
+solveTime = toc;
+
+%% 8. Analysis and Plotting
+
+uInterior = uSol(2:numCells + 1);
+
+% Calculate L2 Difference against Sharp Interface Limit
+diffVec = uInterior - uRefCenter;
+l2Diff = sqrt(sum(diffVec.^2) / numCells);
+
+fprintf('\nSolver finished in %.4f seconds.\n', solveTime);
+fprintf('Final Residual Norm:   %.6e\n', errorHistory(iterStop, 1));
+fprintf('Final Correction Norm: %.6e\n', errorHistory(iterStop, 2));
+fprintf('L2 Diff (u_eps vs u_0): %.6e\n', l2Diff);
+
+% --- Plotting Results (reproducing Figure 5.1) ---
+
+% Figure 1: Solution Comparison
+figure(1)
+clf
+% Plot Exact Limit u_0
+plot(xCenter, uRefCenter, 'r--', 'LineWidth', 2.5); hold on;
+% Plot Numerical Solution u_eps
+plot(xCenter, uInterior, 'k-', 'LineWidth', 1.5);
+legend('True Limit (u_0)', ['Numerical (u_\epsilon), \epsilon=' num2str(epsilon)], 'Location', 'SouthWest');
+title(['One-Sided Problem (\alpha=' num2str(alpha) ', \beta=' num2str(beta) ')']);
+xlabel('x'); ylabel('y');
+grid on;
+xlim([-1 1]);
+ylim([-6 8]); % Adjusted to match Figure 5.1 y-axis range roughly
+
+% Figure 2: Convergence History
+figure(2)
+clf
+semilogy(1:iterStop, errorHistory(1:iterStop, 1), 'k-o', 'LineWidth', 1.2, 'MarkerSize', 4); hold on;
+semilogy(1:iterStop, errorHistory(1:iterStop, 2), 'r-s', 'LineWidth', 1.2, 'MarkerSize', 4); 
+semilogy(1:iterStop, errorHistory(1:iterStop, 3), 'b--', 'LineWidth', 1.5);
+legend('Algebraic Residual', 'Correction Norm', 'Physical Diff ||u_\epsilon - u_0||');
+title('Solver Convergence History');
+xlabel('Cycle'); ylabel('Error / Residual');
+grid on;--------------
+<FDOperator.m>
+function operatorResult = FDOperator(u,DeW,C,hf)
+
+nfPlusGhostLayers = length(u);
+nf = nfPlusGhostLayers-2;
+feW = zeros(nf+1,1);
+operatorResult = zeros(nf,1);
+
+hf2 = hf*hf;
+
+% Vectorized code for the operator:
+% - (D u')' + C(x) u 
+
+% Compute east-west numerical flux:
+feW(1:nf+1) = DeW(1:nf+1).*(u(2:nf+2)-u(1:nf+1));
+
+operatorResult(1:nf) = -(feW(2:nf+1)-feW(1:nf))/hf2...
+                       +C.*u(2:nf+1);
+
+end--------------
+<MGOperator.m>
+function u = MGOperator(level,f,DeW,C,u,hf,MGParam)
+
+% Pre-smoothing
+% u = smoothQJacDamped(f,DeW,C,u,hf,MGParam.m1,...
+%                      MGParam.omega);
+
+% Alternative pre-smoothing options:
+% u = smoothRichardson(f,DeW,C,u,hf,MGParam.m1,...
+%                      MGParam.omega);
+u = smoothQGSDamped(f,DeW,C,u,hf,MGParam.m1,...
+                    MGParam.omega,'fwd');
+
+if level > 0
+  hc = 2*hf;
+  nfPlusGhost = length(u);
+  nf = nfPlusGhost-2;
+
+  % Coarse grid interior dimension is nc.
+  nc = nf/2;
+
+  % Compute the residual and restric to the coarse grid.
+  cGr = restriction(getResidual(u,f,DeW,C,hf));
+    
+  % Restrict the diffusion coefficients to the coarse
+  % grid.
+  cDeW = restrictDiff(DeW);
+    
+  % Restrict the reaction coefficient to the coarse grid.
+  cC = restriction(C);
+  % Injection based restriction.
+  % cC = C(1:2:end);
+  
+  % Approximate on the coarse grid using recursive MG.
+  cGc = zeros(nc+2,1);
+  for s = 1:MGParam.pCycle
+    cGc = MGOperator(level-1,cGr,cDeW,cC,cGc,hc,MGParam);
+  end
+
+  % Prolongate the coarse grid correction and update the
+  % fine grid approximation.
+  u(2:nf+1) = u(2:nf+1)+prolongation(cGc(2:nc+1));
+    
+  % Post-smoothing.
+  % u = smoothQJacDamped(f,DeW,C,u,hf,MGParam.m2,...
+  %                      MGParam.omega);
+
+  % Alternative post-smoothing options:
+  % u = smoothRichardson(f,DeW,C,u,hf,MGParam.m2,...
+  %                      MGParam.omega);
+  u = smoothQGSDamped(f,DeW,C,u,hf,MGParam.m2,...
+                      MGParam.omega,'bwd');
+end
+
+end--------------
+<applyBCs.m>
+function u = applyBCs(u)
+
+nfPlusGhostLayers = length(u);
+nf = nfPlusGhostLayers-2;
+
+% Homogeneous Dirichlet BC:
+
+% u(   1) = -u(   2);
+% u(nf+2) = -u(nf+1);
+
+% Homogeneous Neumann BC:
+
+u(   1) = u(   2);
+u(nf+2) = u(nf+1);
+
+% Periodic BC:
+
+% u(   1) = u(nf+1);
+% u(nf+2) = u(   2);
+
+end--------------
+<elliptic1DMGCCDiff.m>
+%
+%   DDMSolver1D.m
+%
+%   Solves the 1D Diffuse Domain Approximation problem corresponding to 
+%   Figure 4.1 in the PDF.
+%
+%   Equation:
+%   -(D u')' + C u = F
+%
+%   Where:
+%   D = alpha + (1-alpha)phi
+%   C = c_eps + kappa * phi'
+%   F = f_eps - lambda * phi'
+%
+%   Naming Convention: CamelCase
+%   Solver: Multigrid (Cell-Centered)
+%
+
+clear; clc;
+
+%% 1. Simulation Parameters
+
+% Use a power of 2 for Multigrid compatibility
+% 2^18 = 262144
+numLevels = 18; 
+numCells  = 2^numLevels;
+
+% Domain
+xLower = -1.0;
+xUpper =  1.0;
+hMesh  = (xUpper - xLower) / numCells;
+
+% Problem Parameters (Matching PDF Section 4.1 / Figure 4.1)
+epsilon = 0.0025; 
+alpha   = 0.5;     
+beta    = 1.0;
+gamma   = 1.0;
+kappa   = 1.6; 
+
+%% 2. Grid and Coordinate Setup
+
+% Cell Centers
+xCenter = linspace(xLower + hMesh/2, xUpper - hMesh/2, numCells)';
+
+% Cell Edges
+xEdge = linspace(xLower, xUpper, numCells+1)';
+
+%% 3. Construct Sharp Interface Solution (uRef)
+% Used for calculating the Physical Error ||u_eps - u_0||
+
+uRefCenter = zeros(numCells, 1);
+
+for i = 1:numCells
+    xVal = xCenter(i);
+    if xVal <= 0
+        % Left domain: u_L(x) = 8(x+1)^2 - 2
+        uRefCenter(i) = 8 * (xVal + 1)^2 - 2;
+    else
+        % Right domain: u_R(x) = (4x^2 - 8x + 6)cos(4pi x)
+        uRefCenter(i) = (4 * xVal^2 - 8 * xVal + 6) * cos(4 * pi * xVal);
+    end
+end
+
+% Fill ghost layers for BCs (Neumann) in uRef
+uRef = zeros(numCells + 2, 1);
+uRef(2:numCells + 1) = uRefCenter;
+uRef = applyBCs(uRef);
+
+%% 4. Calculate Lambda Explicitly
+% Condition: u'_R(0) - alpha*u'_L(0) = kappa*u(0) + lambda
+
+uZero      = 6.0;
+duLeftZero = 16.0;   % u_L'(0)
+duRightZero= -8.0;   % u_R'(0)
+
+lambda = (duRightZero - alpha * duLeftZero) - kappa * uZero;
+
+fprintf('Calculated Lambda: %.4f (Expected -25.6)\n', lambda);
+
+%% 5. Pre-Compute Coefficient Arrays (No Inline Functions)
+
+% --- Phase Field Computations ---
+% phi(x) = 0.5 * (1 + tanh(3x/eps))
+% phi'(x) = (1.5 * sech(3x/eps)^2) / eps
+
+% Compute at Edges (for Diffusion Coefficient)
+argEdge = 3.0 * xEdge / epsilon;
+phiEdge = 0.5 * (1.0 + tanh(argEdge));
+
+% Compute at Centers (for Reaction and RHS)
+argCenter = 3.0 * xCenter / epsilon;
+phiCenter = 0.5 * (1.0 + tanh(argCenter));
+phiPrimeCenter = (1.5 * sech(argCenter).^2) / epsilon;
+
+% --- Diffusion Coefficient D (at Edges) ---
+% D = alpha + (1-alpha)phi
+diffCoefEdge = alpha + (1.0 - alpha) * phiEdge;
+
+% --- Reaction Coefficient C (at Centers) ---
+% c_eps = beta(1-phi) + gamma*phi
+cEps = beta * (1.0 - phiCenter) + gamma * phiCenter;
+
+% Operator C = c_eps + kappa * phi'
+reacCoefCenter = cEps + kappa * phiPrimeCenter;
+
+% --- Forcing Functions h(x) and q(x) (at Centers) ---
+
+% h(x)
+hFunc = -alpha * 16.0 + beta * (8.0 * (xCenter + 1.0).^2 - 2.0);
+
+% q(x)
+term1 = (1.0 - 4.0 * pi^2 * (2.0 * xCenter.^2 - 4.0 * xCenter + 3.0)) .* cos(4.0 * pi * xCenter);
+term2 = 8.0 * pi * (xCenter - 1.0) .* sin(4.0 * pi * xCenter);
+term3 = gamma * (4.0 * xCenter.^2 - 8.0 * xCenter + 6.0) .* cos(4.0 * pi * xCenter);
+qFunc = -8.0 * (term1 - term2) + term3;
+
+% f_eps = h(1-phi) + q*phi
+fEps = hFunc .* (1.0 - phiCenter) + qFunc .* phiCenter;
+
+% Total RHS Vector F = f_eps - lambda * phi'
+rhsVector = fEps - lambda * phiPrimeCenter;
+
+%% 6. Multigrid Configuration
+
+MGParam.nL     = numCells;
+MGParam.xLower = xLower;
+MGParam.xUpper = xUpper;
+MGParam.L      = numLevels;
+MGParam.pCycle = 1;       % V-cycle
+MGParam.m1     = 2;       % Pre-smoothing
+MGParam.m2     = 2;       % Post-smoothing
+MGParam.omega  = 2/3;     % Damped Jacobi weight
+MGParam.kMax   = 50;      % Max iterations
+MGParam.tol    = 1.0e-11; 
+MGParam.C      = reacCoefCenter; % Pass computed C array
+
+uInit = zeros(numCells + 2, 1);
+
+%% 7. Run Solver
+
+fprintf('Starting Multigrid Solver with N = %d, epsilon = %.5f...\n', numCells, epsilon);
+tic;
+% Passing uRef as the "Exact" solution for error tracking column 3
+[uSol, errorHistory, iterStop] = multiGridSolver(uInit, rhsVector, diffCoefEdge, ...
+                                                 reacCoefCenter, hMesh, ...
+                                                 MGParam, uRef);
+solveTime = toc;
+
+%% 8. Analysis and Plotting
+
+uInterior = uSol(2:numCells + 1);
+
+% Calculate L2 Difference against Sharp Interface Limit
+diffVec = uInterior - uRefCenter;
+l2Diff = sqrt(sum(diffVec.^2) / numCells);
+
+fprintf('\nSolver finished in %.4f seconds.\n', solveTime);
+fprintf('Final Residual Norm:   %.6e\n', errorHistory(iterStop, 1));
+fprintf('Final Correction Norm: %.6e\n', errorHistory(iterStop, 2));
+fprintf('L2 Diff (u_eps vs u_0): %.6e\n', l2Diff);
+
+% --- Log-Linear Fit for Convergence Rate ---
+% Using the Correction Norm (Column 2)
+if iterStop >= 4
+    startIndex = iterStop - 3;
+    endIndex   = iterStop;
+    
+    yData = log(errorHistory(startIndex:endIndex, 2));
+    xData = (startIndex:endIndex)';
+    
+    % Polyfit degree 1
+    pFit = polyfit(xData, yData, 1);
+    convergenceRate = exp(pFit(1));
+    
+    fprintf('Estimated Convergence Rate (rho): %.4f\n', convergenceRate);
+else
+    fprintf('Insufficient iterations for convergence fit.\n');
+end
+
+% --- Plotting ---
+
+% Figure 1: Solution Comparison
+figure(1)
+clf
+plot(xCenter, uRefCenter, 'r-', 'LineWidth', 3); hold on;
+plot(xCenter, uInterior, 'b--', 'LineWidth', 2);
+legend('Sharp Interface (u_0)', ['DDM (u_\epsilon), \epsilon=' num2str(epsilon)], 'Location', 'NorthWest');
+title(['DDM Solution vs Sharp Interface (\alpha=' num2str(alpha) ')']);
+xlabel('x'); ylabel('u');
+grid on;
+xlim([-1 1]);
+ylim([-20 10]); 
+
+% Figure 2: Convergence History
+figure(2)
+clf
+semilogy(1:iterStop, errorHistory(1:iterStop, 1), 'k-o', 'LineWidth', 1.2, 'MarkerSize', 4); hold on;
+semilogy(1:iterStop, errorHistory(1:iterStop, 2), 'r-s', 'LineWidth', 1.2, 'MarkerSize', 4); 
+semilogy(1:iterStop, errorHistory(1:iterStop, 3), 'b--', 'LineWidth', 1.5);
+
+% Add fit line
+if iterStop >= 4
+    xFit = 1:iterStop;
+    yFit = exp(polyval(pFit, xFit));
+    semilogy(xFit, yFit, 'g-', 'LineWidth', 1.0);
+    legend('Algebraic Residual', 'Correction Norm', 'Physical Diff ||u_\epsilon - u_0||', ...
+           ['Fit (\gamma_{comp} \approx ' num2str(convergenceRate, '%.2f') ')']);
+else
+    legend('Algebraic Residual', 'Correction Norm', 'Physical Diff ||u_\epsilon - u_0||');
+end
+
+title('Multigrid Convergence History');
+xlabel('Cycle'); ylabel('Error / Residual');
+grid on;--------------
+<getResidual.m>
+function residualResult = getResidual(u,f,DeW,C,hf)
+
+% Apply the boundary conditions before residual 
+% computation.
+u = applyBCs(u);
+nf = length(f);
+residualResult = zeros(nf,1);
+
+residualResult = f-FDOperator(u,DeW,C,hf);
+
+end--------------
+<multiGridSolver.m>
+function [u,errVals,kStop] =...
+              multiGridSolver(u0,f,DeW,C,hf,MGParam,uExact)
+
+nf = length(f);
+k = 0;
+errorVal = MGParam.tol+1.0;
+errVals = zeros(MGParam.kMax,3);
+
+uo = u0;
+
+while ((k < MGParam.kMax) && (errorVal > MGParam.tol))
+
+  % Apply one multigrid cycle.
+  u = MGOperator(MGParam.L,f,DeW,C,uo,hf,MGParam);
+
+  % Evaluate various norms.
+  residErr = normScaledL2(getResidual(u,f,DeW,C,hf));
+  correErr = normScaledL2(uo(2:nf+1)-u(2:nf+1));
+  exactErr = normScaledL2(uExact(2:nf+1)-u(2:nf+1));
+
+  k = k+1;
+  errVals(k,1) = residErr;
+  errVals(k,2) = correErr;
+  errVals(k,3) = exactErr;
+
+  fprintf('Multigrid iteration %d:\n', k);
+  fprintf('  residual   = %.6e\n', residErr);
+  fprintf('  correction = %.6e\n', correErr);
+  fprintf('  true error = %.6e\n', exactErr);
+
+  % Stopping criterion (artificial, for demonstration).
+  errorVal = correErr;  
+  uo = u;
+end
+
+kStop = k;
+
+end--------------
+<normScaledL2.m>
+function normResult = normScaledL2(u)
+
+nf = length(u);
+normResult = sqrt(sum(u.*u)/nf);
+
+end--------------
+<prolongation.m>
+function presult = prolongation(u)
+
+nc = length(u);
+nf = nc*2;
+presult = zeros(nf,1);
+
+presult(2:2:nf  ) = u(1:nc(1));
+presult(1:2:nf-1) = u(1:nc(1));
+
+end--------------
+<restrictDiff.m>
+function cDeW = restrictDiff(DeW)
+
+nfEw = length(DeW);
+nf = nfEw-1;
+nc = nf/2;
+cDeW = zeros(nc+1,1);
+
+cDeW(1:nc+1) = DeW(1:2:nf+1);
+
+end--------------
+<restriction.m>
+function restrictionResult = restriction(u)
+
+nf = length(u);
+nc = nf/2;
+
+restrictionResult = 0.5*(u(1:2:nf-1)+u(2:2:nf));
+
+end--------------
+<smoothQGSDamped.m>
+function u = smoothQGSDamped(f,DeW,C,u,hf,m,omega,...
+                             sweepDirection)
+
+nfPlusGhostLayers = length(u);
+nf = nfPlusGhostLayers-2;
+
+hf2 = hf*hf;
+omegaPrime = 1.0-omega;
+
+switch sweepDirection
+  case 'fwd'
+    sweepIndex = [1:nf];
+  otherwise
+    sweepIndex = [nf:-1:1];
+end
+
+u = applyBCs(u);
+
+for sweep = 1:m
+  for i = sweepIndex
+
+    tmp = (hf2*f(i)+u(i+2)*DeW(i+1)+u(i)*DeW(i))...
+          /(DeW(i+1)+DeW(i)+C(i)*hf2);
+    u(i+1) = omega*tmp+omegaPrime*u(i+1);
+
+  end
+  u = applyBCs(u);
+
+end
+
+end--------------
+<smoothQJacDamped.m>
+function u = smoothQJacDamped(f,DeW,C,u,hf,m,omega)
+
+nfPlusGhostLayers = length(u);
+nf = nfPlusGhostLayers-2;
+
+z = zeros(nf,1);
+
+hf2 = hf*hf;
+omegaPrime = 1.0-omega;
+
+u = applyBCs(u);
+
+for sweep = 1:m
+  for i = 1:nf
+
+    z(i) = (hf2*f(i)+u(i+2)*DeW(i+1)+u(i)*DeW(i))...
+           /(DeW(i+1)+DeW(i)+C(i)*hf2);
+
+  end
+
+  u(2:nf+1) = omega*z(1:nf)+omegaPrime*u(2:nf+1);
+  u = applyBCs(u);
+  
+end
+
+end--------------
+<smoothRichardson.m>
+function u = smoothRichardson(f,DeW,C,u,hf,m,omega)
+
+nfPlusGhostLayers = length(u);
+nf = nfPlusGhostLayers-2;
+hf2 = hf*hf;
+r = zeros(nf,1);
+
+u = applyBCs(u);
+
+for sweep = 1:m
+  r(1:nf) = getResidual(u,f,DeW,C,hf);
+  u(2:nf+1) = u(2:nf+1)+omega*(hf2/2.0)*r(1:nf);
+  u = applyBCs(u);
+end
+
+end--------------

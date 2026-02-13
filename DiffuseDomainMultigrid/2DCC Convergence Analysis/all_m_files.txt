@@ -1,0 +1,660 @@
+<ConvergenceAnalysis2D.m>
+%
+%   runConvergenceAnalysis.m
+%
+%   Performs convergence analysis of the 2D DDM solver.
+%   Includes SMART MEMORY MANAGEMENT to prevent computer freezing.
+%
+
+clear; clc;
+
+%% 1. Configuration
+
+% --- Analysis Mode ---
+% 1: Fixed Alpha, Vary Epsilon
+% 2: Fixed Epsilon, Vary Alpha
+% 3: Coupled Alpha = Epsilon^p
+mode = 3; 
+
+% --- Grid Settings ---
+L = 13; 
+nL = [2^L, 2^L]; 
+xyLower = [-2.0, -2.0];
+xyUpper = [ 2.0,  2.0];
+
+% --- Multigrid Settings ---
+MGParam.L      = L;
+MGParam.xLower = xyLower;
+MGParam.xUpper = xyUpper;
+MGParam.pCycle = 2;
+MGParam.m1     = 2;
+MGParam.m2     = 2;
+MGParam.omega  = 0.66;
+MGParam.kMax   = 200;
+MGParam.tol    = 1.0e-12;
+
+% --- Parameter Ranges ---
+numPoints = 20; 
+
+% Default setups
+epsRange_1   = logspace(log10(0.01), log10(0.0006), numPoints);
+alphaFixed_1 = 3.0;
+
+alphaRange_2 = logspace(log10(1.5), log10(0.008), numPoints);
+epsFixed_2   = 0.05;
+
+epsRange_3   = logspace(log10(0.01), log10(0.0006), numPoints);
+p_exponent   = 2.0; 
+
+% Fixed Physics Constants
+beta = 0.0; gamma = 1.0; kappa = 2.01;
+
+%% 2. Pre-computation
+
+fprintf('Setting up Geometry and Pre-computing Fields (N=%d)...\n', nL(1));
+hMesh = (xyUpper(1) - xyLower(1)) / nL(1);
+
+xCenter = linspace(xyLower(1) + hMesh/2, xyUpper(1) - hMesh/2, nL(1));
+yCenter = linspace(xyLower(2) + hMesh/2, xyUpper(2) - hMesh/2, nL(2));
+[XCC, YCC] = ndgrid(xCenter, yCenter);
+
+xEdgePts = linspace(xyLower(1), xyUpper(1), nL(1)+1);
+yEdgePts = linspace(xyLower(2), xyUpper(2), nL(2)+1);
+[XEW, YEW] = ndgrid(xEdgePts, yCenter);
+[XNS, YNS] = ndgrid(xCenter, yEdgePts);
+
+% SDF Caching
+sdfFileName = sprintf('SDF_Data_N%d.mat', nL(1));
+if exist(sdfFileName, 'file')
+    fprintf('  Loading pre-computed SDF...\n');
+    load(sdfFileName, 'distCenter', 'distEW', 'distNS', 'polyX', 'polyY');
+else
+    fprintf('  Computing SDF via C++ Fast Marching...\n');
+    [polyX, polyY] = generateBoundary(2500);
+    distCenter = computeSignedDistance(XCC, YCC, polyX, polyY, hMesh);
+    distEW = computeSignedDistance(XEW, YEW, polyX, polyY, hMesh);
+    distNS = computeSignedDistance(XNS, YNS, polyX, polyY, hMesh);
+    save(sdfFileName, 'distCenter', 'distEW', 'distNS', 'polyX', 'polyY');
+end
+
+% Pre-compute forcing
+fprintf('  Pre-computing forcing fields...\n');
+qFunc = -XCC.^2 +  15.0;
+% hFunc = 2.5 .* sin(XCC) + exp(cos(YCC));
+hFunc = 0.0 * ones(nL(1), nL(2));
+gFunc = sin(XCC) + cos(XCC).^2 + 5;
+
+% Pack Data
+precompData.distCenter = distCenter;
+precompData.distEW = distEW;
+precompData.distNS = distNS;
+precompData.qFunc = qFunc;
+precompData.hFunc = hFunc;
+precompData.gFunc = gFunc;
+
+gridInfo.nL = nL;
+gridInfo.hMesh = hMesh;
+
+% Clear heavy variables to free Main RAM before forking
+clear XCC YCC XEW YEW XNS YNS distCenter distEW distNS qFunc hFunc gFunc;
+
+%% 3. Experiment Setup
+
+paramList = repmat(struct('epsilon',0,'alpha',0,'beta',beta,'gamma',gamma,'kappa',kappa), numPoints, 1);
+xPlot = zeros(numPoints, 1); 
+
+switch mode
+    case 1, xLabelStr = '$\varepsilon$';
+        for i = 1:numPoints, paramList(i).epsilon = epsRange_1(i); paramList(i).alpha = alphaFixed_1; xPlot(i) = epsRange_1(i); end
+    case 2, xLabelStr = '$\alpha$';
+        for i = 1:numPoints, paramList(i).epsilon = epsFixed_2; paramList(i).alpha = alphaRange_2(i); xPlot(i) = alphaRange_2(i); end
+    case 3, xLabelStr = '$\varepsilon$';
+        for i = 1:numPoints, epsVal = epsRange_3(i); paramList(i).epsilon = epsVal; paramList(i).alpha = epsVal^p_exponent; xPlot(i) = epsVal; end
+end
+
+%% 4. Smart Parallel Pool Configuration (THE FIX)
+
+% --- Memory Estimation ---
+% A double is 8 bytes.
+% MG Solver stores: u, rhs, diffEW, diffNS, reac (5 arrays).
+% Plus internal MG levels (approx 1.33x overhead).
+% Plus temporary smoothers/residual vectors (approx 3x overhead).
+% Rough heuristic: ~30-40 vectors of size N*N.
+bytesPerDouble = 8;
+elements = nL(1) * nL(2);
+memPerWorkerGB = (40 * elements * bytesPerDouble) / 1024^3; 
+
+fprintf('\n--- Resource Management ---\n');
+fprintf('Estimated RAM per Worker: %.2f GB\n', memPerWorkerGB);
+
+% --- Detect System RAM (Mac/Linux/Windows) ---
+try
+    if ismac || isunix
+        [~, memStr] = system('sysctl -n hw.memsize'); % Mac
+        if isempty(memStr), [~, memStr] = system('grep MemTotal /proc/meminfo | awk ''{print $2}'''); end % Linux
+        totalRAM_GB = str2double(strtrim(memStr)) / 1024^3;
+        if isunix && ~ismac, totalRAM_GB = totalRAM_GB / 1024; end % Linux returns kB
+    elseif ispc
+        [~, sys] = memory;
+        totalRAM_GB = sys.PhysicalMemory.Total / 1024^3;
+    else
+        totalRAM_GB = 16; % Fallback assumption
+    end
+catch
+    totalRAM_GB = 16; % Fallback if detection fails
+end
+
+% --- Calculate Safe Limit ---
+% Leave 4GB for OS + MATLAB Main Thread
+availableRAM = max(0, totalRAM_GB - 4.0); 
+
+% Calculate max workers that fit in RAM
+maxWorkersRAM = floor(availableRAM / memPerWorkerGB);
+
+% Cap at physical cores (usually 8 or 10 on M1/M2/M3) or 1 if RAM is tight
+maxWorkers = max(1, min(feature('numcores'), maxWorkersRAM));
+
+fprintf('Total System RAM:       %.2f GB\n', totalRAM_GB);
+fprintf('Safe RAM for Workers:   %.2f GB\n', availableRAM);
+fprintf('Max Workers (RAM-bound): %d\n', maxWorkersRAM);
+fprintf('<strong>Configuring Pool size to: %d</strong>\n', maxWorkers);
+
+% --- Reconfigure Pool ---
+currentPool = gcp('nocreate');
+if ~isempty(currentPool)
+    if currentPool.NumWorkers ~= maxWorkers
+        delete(currentPool);
+        parpool(maxWorkers);
+    end
+else
+    parpool(maxWorkers);
+end
+
+%% 5. Parallel Solver Execution
+
+fprintf('\nStarting Parallel Execution...\n');
+solutions = cell(numPoints, 1);
+
+tic;
+% parfor will now distribute jobs to the limited pool size.
+% If you have 8 jobs but pool size is 2, it runs 2 at a time (safe!).
+parfor i = 1:numPoints
+    fprintf('  Job %d running... (Eps=%.2e)\n', i, paramList(i).epsilon);
+    solutions{i} = computeDiffuseDomainSolution2D(gridInfo, paramList(i), precompData, MGParam);
+end
+totalTime = toc;
+fprintf('All jobs finished in %.2f seconds.\n', totalTime);
+
+%% 6. Convergence Analysis
+
+cauchyErrors = zeros(numPoints-1, 1);
+xMid = zeros(numPoints-1, 1);
+
+fprintf('\nComputing L-inf Cauchy Differences:\n');
+for i = 1:numPoints-1
+    u1 = solutions{i};
+    u2 = solutions{i+1};
+    
+    diff = u1 - u2;
+    linf_diff = max(abs(diff(:))); % Changed from L2 (RMS) to L-infinity (Max Abs)
+    
+    cauchyErrors(i) = linf_diff;
+    xMid(i) = xPlot(i+1); 
+end
+
+%% 7. Plotting
+
+figure(1); clf;
+set(gcf, 'Color', 'w');
+
+% Main Log-Log Plot
+loglog(xMid, cauchyErrors, 'ko-', 'LineWidth', 1.5, 'MarkerSize', 10, 'MarkerFaceColor', 'b');
+grid on;
+hold on;
+
+slope = NaN;
+if length(xMid) >= 2
+    % Linear Fit on Log Data
+    p = polyfit(log(xMid), log(cauchyErrors), 1);
+    slope = p(1);
+    yFit = exp(polyval(p, log(xMid)));
+    
+    % Plot Fit Line (Thick dashed red)
+    loglog(xMid, yFit, 'r--', 'LineWidth', 2.5);
+    
+    % Legend in Top Left
+    legend('Cauchy Diff $||u(\cdot;\varepsilon_{k+1},\alpha_{k+1})-u(\cdot;\varepsilon_{k},\alpha_{k})||_{L^\infty}$', sprintf('Fit (Slope = %.2f)', slope), ...
+           'Location', 'NorthWest', 'Interpreter', 'latex', 'FontSize', 12);
+end
+
+% Labels
+xlabel(xLabelStr, 'Interpreter', 'latex', 'FontSize', 16);
+ylabel('$L^\infty$ Difference', 'Interpreter', 'latex', 'FontSize', 16);
+
+% Title
+titleStr = sprintf('Convergence (Mode %d)', mode);
+if mode == 3, titleStr = [titleStr, sprintf(', $p=%.1f$', p_exponent)]; end
+title(titleStr, 'Interpreter', 'latex', 'FontSize', 16);
+
+% Axis Ticks formatting
+set(gca, 'FontSize', 12, 'TickLabelInterpreter', 'latex');
+
+% Annotation Box in Bottom Right
+% [x y w h] normalized coordinates (0,0 is bottom left)
+dim = [0.65 0.15 0.2 0.1]; 
+str = {sprintf('Points: %d', numPoints), ...
+       sprintf('Slope: %.2f', slope)};
+
+annotation('textbox', dim, 'String', str, ...
+           'FitBoxToText', 'on', ...
+           'BackgroundColor', 'w', ...
+           'EdgeColor', 'k', ...
+           'FontSize', 12, ...
+           'Interpreter', 'latex');
+
+fprintf('\nEstimated Convergence Rate: %.4f\n', slope);--------------
+<FDOperator.m>
+function operatorResult = FDOperator(u,DeW,DnS,C,hf)
+
+nfPlusGhostLayers = size(u);
+nf = nfPlusGhostLayers-2;
+
+nx = nf(1);
+ny = nf(2);
+hf2 = hf*hf;
+
+% Vectorized Code for the operator:
+%
+% - div(D grad(u)) + C(x) u 
+%
+% Compute east-west and north-south fluxes:
+feW(1:nx+1,1:ny) = DeW(1:nx+1,1:ny).*(u(2:nx+2,2:ny+1)...
+                   -u(1:nx+1,2:ny+1));
+fnS(1:nx,1:ny+1) = DnS(1:nx,1:ny+1).*(u(2:nx+1,2:ny+2)...
+                   -u(2:nx+1,1:ny+1));
+
+% Compute the divergence of the fluxes and add reaction 
+% term:
+operatorResult(1:nx,1:ny) =...
+                 -(feW(2:nx+1,1:ny)-feW(1:nx,1:ny)...
+                 +fnS(1:nx,2:ny+1)-fnS(1:nx,1:ny))/hf2...
+                 +C.*u(2:nx+1,2:ny+1);
+
+end--------------
+<MGOperator.m>
+function u = MGOperator(level,f,DeW,DnS,C,u,hf,MGParam)
+
+% Pre-smoothing
+% u = smoothQJacDamped(f,DeW,DnS,C,u,hf,MGParam.m1,...
+%                      MGParam.omega);
+
+% Alternative pre-smoothing option:
+u = mex_smoothQGSDamped(f,DeW,DnS,C,u,hf,MGParam.m1,...
+                    MGParam.omega,'fwd');
+
+if level > 0
+  hc = 2*hf;
+  nfPlusGhost = size(u);
+  nf = nfPlusGhost-2;
+
+  % Coarse grid interior dimensions are [nc(1),nc(2)].
+  nc = nf/2;
+
+  % Compute the residual and restric to the coarse grid.
+  cGr = restriction(getResidual(u,f,DeW,DnS,C,hf));
+    
+  % Restrict the diffusion coefficients to the coarse 
+  % grid.
+  [cDeW,cDnS] = restrictDiff(DeW,DnS);
+  
+  % Restrict the reaction coefficient to the coarse grid.
+  cC = restriction(C);
+    
+  % Approximate on the coarse grid using recursive MG.
+  cGc = zeros(nc(1)+2,nc(2)+2);
+  for s = 1:MGParam.pCycle
+    cGc =...
+        MGOperator(level-1,cGr,cDeW,cDnS,cC,cGc,hc,MGParam);
+  end
+
+  % Prolongate the coarse grid correction and update the
+  % fine grid approximation.
+  u(2:nf(1)+1,2:nf(2)+1) = u(2:nf(1)+1,2:nf(2)+1)...
+                 +prolongation(cGc(2:nc(1)+1,2:nc(2)+1));
+    
+  % Post-smoothing.
+  % u = smoothQJacDamped(f,DeW,DnS,C,u,hf,MGParam.m2,...
+  %                      MGParam.omega);
+
+  % Alternative post-smoothing option:
+  u = mex_smoothQGSDamped(f,DeW,DnS,C,u,hf,MGParam.m2,...
+                      MGParam.omega,'bwd');
+end
+
+end--------------
+<applyBCs.m>
+function u = applyBCs(u)
+
+nfPlusGhostLayers = size(u);
+nf = nfPlusGhostLayers-2;
+
+% Homogeneous Dirichlet BC:
+
+% u(2:nf(1)+1,        1) = -u(2:nf(1)+1,        2);
+% u(2:nf(1)+1,  nf(2)+2) = -u(2:nf(1)+1,  nf(2)+1);
+% u(        1,1:nf(2)+2) = -u(        2,1:nf(2)+2);
+% u(  nf(1)+2,1:nf(2)+2) = -u(  nf(1)+1,1:nf(2)+2);
+
+% Homogeneous Neumann BC:
+
+u(2:nf(1)+1,        1) = u(2:nf(1)+1,        2);
+u(2:nf(1)+1,  nf(2)+2) = u(2:nf(1)+1,  nf(2)+1);
+u(        1,1:nf(2)+2) = u(        2,1:nf(2)+2);
+u(  nf(1)+2,1:nf(2)+2) = u(  nf(1)+1,1:nf(2)+2);
+
+% Periodic BC:
+
+% u(2:nf(1)+1,        1) = u(2:nf(1)+1,  nf(2)+1);
+% u(2:nf(1)+1,  nf(2)+2) = u(2:nf(1)+1,        2);
+% u(        1,1:nf(2)+2) = u(  nf(1)+1,1:nf(2)+2);
+% u(  nf(1)+2,1:nf(2)+2) = u(        2,1:nf(2)+2);
+
+end--------------
+<computeDiffuseDomainSolution2D.m>
+function uInterior = computeDiffuseDomainSolution2D(gridInfo, physParam, precompData, solverParam)
+% computeDiffuseDomainSolution2D
+%
+% Solves the DDM Starfish problem for a specific set of parameters.
+%
+% OPTIMIZATION:
+% All spatially-dependent but parameter-independent fields (SDF, q, h, g)
+% are passed in 'precompData' to avoid redundant calculation.
+%
+% Inputs:
+%   gridInfo    : Struct (nL, hMesh)
+%   physParam   : Struct (epsilon, alpha, beta, gamma, kappa)
+%   precompData : Struct (distCenter, distEW, distNS, qFunc, hFunc, gFunc)
+%   solverParam : Struct (MG settings)
+
+    % Unpack Grid Params
+    nL = gridInfo.nL;
+    hMesh = gridInfo.hMesh;
+
+    % Unpack Physics Params
+    epsilon = physParam.epsilon;
+    alpha   = physParam.alpha;
+    beta    = physParam.beta;
+    gamma   = physParam.gamma;
+    kappa   = physParam.kappa;
+    
+    % ---------------------------------------------------------
+    % 1. Compute Coefficients (Depend on Epsilon/Alpha)
+    % ---------------------------------------------------------
+
+    % --- Diffusion Coefficient D (at Edges) ---
+    % D = alpha + (1-alpha)*phi
+    % precompData.distEW/NS are passed in directly
+    
+    phiEW = 0.5 .* (1.0 + tanh(precompData.distEW ./ epsilon));
+    diffCoefEW = alpha + (1.0 - alpha) .* phiEW;
+
+    phiNS = 0.5 .* (1.0 + tanh(precompData.distNS ./ epsilon));
+    diffCoefNS = alpha + (1.0 - alpha) .* phiNS;
+
+    % --- Reaction Coefficient C (at Centers) ---
+    argCC = precompData.distCenter ./ epsilon;
+    
+    % Optimization: Compute common terms once
+    tanhPhi = tanh(argCC);
+    phiCC = 0.5 .* (1.0 + tanhPhi);
+
+    % Gradient Magnitude: (1/(2eps)) * (1 - tanh^2)
+    % sech^2(x) = 1 - tanh^2(x)
+    absGradPhi = (1.0 / (2.0 * epsilon)) .* (1.0 - tanhPhi.^2);
+
+    % c_eps = beta*(1-phi) + gamma*phi
+    cEps = beta .* (1.0 - phiCC) + gamma .* phiCC;
+
+    % Total Operator C = c_eps + kappa * |grad phi|
+    reacCoef = cEps + kappa .* absGradPhi;
+
+    % ---------------------------------------------------------
+    % 2. Compute RHS Forcing
+    % ---------------------------------------------------------
+    
+    % f_eps = h*(1-phi) + q*phi
+    % hFunc and qFunc are pre-computed!
+    fEps = precompData.hFunc .* (1.0 - phiCC) + precompData.qFunc .* phiCC;
+
+    % Total RHS = f_eps - g * |grad phi|
+    % gFunc is pre-computed
+    rhsVector = fEps - precompData.gFunc .* absGradPhi;
+
+    % ---------------------------------------------------------
+    % 3. Run Multigrid Solver
+    % ---------------------------------------------------------
+    
+    MGParam = solverParam;
+    MGParam.nL = nL;
+    MGParam.C = reacCoef; 
+    
+    uInit = zeros(nL(1)+2, nL(2)+2);
+    uRef  = zeros(nL(1)+2, nL(2)+2); 
+
+    [uSol, ~, ~] = multiGridSolver(uInit, rhsVector, diffCoefEW, ...
+                                   diffCoefNS, reacCoef, hMesh, ...
+                                   MGParam, uRef);
+
+    uInterior = uSol(2:end-1, 2:end-1);
+end--------------
+<computeSignedDistance.m>
+function phi = computeSignedDistance(X, Y, polyX, polyY, h)
+    
+    % Ensure polygon is closed
+    if polyX(1) ~= polyX(end) || polyY(1) ~= polyY(end)
+        polyX(end+1) = polyX(1);
+        polyY(end+1) = polyY(1);
+    end
+
+    % Call C++ FMM
+    phi = mex_computeSignedDistance(X, Y, polyX, polyY, h);
+
+end--------------
+<generateBoundary.m>
+function [x, y] = generateBoundary(n)
+    % Generates boundary coordinates for the interface.
+    
+    theta = linspace(0, 2*pi, n);
+
+    % --- Case 1: Ellipse (PDF Section 4.2, First Example) ---
+    % Ellipse: x^2 + 4y^2 = 4  =>  (x/2)^2 + (y/1)^2 = 1
+    % Semi-major axis a=2, Semi-minor axis b=1
+    
+    % x = 2.0 * cos(theta);
+    % y = 1.0 * sin(theta);
+    
+    % --- Case 2: Starfish (PDF Section 4.2, Equation 4.9) ---
+    % r(theta) = 0.9 * (1.2 + 0.7 * sin(5*theta))
+    % This tests the solver on non-convex geometries.
+    
+    r = 0.9 * (1.2 + 0.7 * sin(5 * theta));
+    
+    x = r .* cos(theta);
+    y = r .* sin(theta);
+end--------------
+<getResidual.m>
+function residualResult = getResidual(u,f,DeW,DnS,C,hf)
+
+% Apply the boundary conditions
+u = applyBCs(u);
+
+residualResult = f-FDOperator(u,DeW,DnS,C,hf);
+
+end--------------
+<multiGridSolver.m>
+function [u,errVals,kStop] =...
+          multiGridSolver(u0,f,DeW,DnS,C,hf,MGParam,uExact)
+
+nf = size(f);
+k = 0;
+errorVal = MGParam.tol+1.0;
+errVals = zeros(MGParam.kMax,3);
+
+uo = u0;
+
+while ((k < MGParam.kMax) && (errorVal > MGParam.tol))
+
+  % Apply one multigrid cycle.
+  u = MGOperator(MGParam.L,f,DeW,DnS,C,uo,hf,MGParam);
+
+  % Evaluate various norms.
+  residErr =...
+            normScaledL2(getResidual(u,f,DeW,DnS,C,hf));
+  correErr = normScaledL2(uo(2:nf(1)+1,2:nf(2)+1)...
+                          -u(2:nf(1)+1,2:nf(2)+1));
+  exactErr = normScaledL2(uExact(2:nf(1)+1,2:nf(2)+1)...
+                          -u(2:nf(1)+1,2:nf(2)+1));
+
+  k = k+1;
+  errVals(k,1) = residErr;
+  errVals(k,2) = correErr;
+  errVals(k,3) = exactErr;
+
+  fprintf('Multigrid iteration %d:\n', k);
+  fprintf('  residual   = %.6e\n', residErr);
+  fprintf('  correction = %.6e\n', correErr);
+  fprintf('  true error = %.6e\n', exactErr);
+
+  % Stopping criterion.
+  errorVal = correErr;  
+  uo = u;
+end
+
+kStop = k;
+
+end--------------
+<normScaledL2.m>
+function normResult = normScaledL2(u)
+
+nf = size(u);
+normResult = sqrt(sum(sum(u.*u))/(nf(1)*nf(2)));
+
+end--------------
+<prolongation.m>
+function presult = prolongation(u)
+
+nc = size(u);
+nf = nc*2;
+presult = zeros(nf);
+
+presult(2:2:nf(1)  ,2:2:nf(2)  ) = u(1:nc(1),1:nc(2));
+presult(1:2:nf(1)-1,2:2:nf(2)  ) = u(1:nc(1),1:nc(2));
+presult(2:2:nf(1)  ,1:2:nf(2)-1) = u(1:nc(1),1:nc(2));
+presult(1:2:nf(1)-1,1:2:nf(2)-1) = u(1:nc(1),1:nc(2));
+
+end--------------
+<restrictDiff.m>
+function [cDeW,cDnS] = restrictDiff(DeW,DnS)
+
+[nxEW,ny] = size(DeW);
+[nx,nyNS] = size(DnS);
+
+ncx = nx/2;  
+ncy = ny/2;
+
+cDeW(1:ncx+1,1:ncy) =...
+       0.5*(DeW(1:2:nx+1,1:2:ny-1)+DeW(1:2:nx+1,2:2:ny));
+
+cDnS(1:ncx,1:ncy+1) =...
+       0.5*(DnS(1:2:nx-1,1:2:ny+1)+DnS(2:2:nx,1:2:ny+1));
+
+end--------------
+<restriction.m>
+function restrictionResult = restriction(u)
+
+nf = size(u);
+nc = nf/2;
+restrictionResult...
+  = 0.25*(u(1:2:nf(1)-1,1:2:nf(2)-1)...
+    +     u(2:2:nf(1)  ,1:2:nf(2)-1)...
+    +     u(1:2:nf(1)-1,2:2:nf(2)  )...
+    +     u(2:2:nf(1)  ,2:2:nf(2)  ));
+
+end--------------
+<smoothQGSDamped.m>
+function u = smoothQGSDamped(f,DeW,DnS,C,u,hf,m,...
+  omega,sweepDirection)
+
+nfPlusGhostLayers = size(u);
+nf = nfPlusGhostLayers-2;
+
+hf2 = hf*hf;
+omegaPrime = 1.0-omega;
+
+switch sweepDirection
+  case 'fwd'
+    xSweepIndex = [1:nf(1)];
+    ySweepIndex = [1:nf(2)];
+  otherwise
+    xSweepIndex = [nf(1):-1:1];
+    ySweepIndex = [nf(2):-1:1];
+end
+
+u = applyBCs(u);
+
+for sweep = 1:m
+  for j = ySweepIndex
+    for i = xSweepIndex
+
+      tmp = (hf2*f(i,j)...
+            +u(i+2,j+1)*DeW(i+1,j  )...
+            +u(i  ,j+1)*DeW(i  ,j  )...
+            +u(i+1,j+2)*DnS(i  ,j+1)...
+            +u(i+1,j  )*DnS(i  ,j  ))...
+            /(DeW(i+1,j)+DeW(i,j)+DnS(i,j+1)+DnS(i,j)...
+            +C(i,j)*hf2);
+      u(i+1,j+1) = omega*tmp+omegaPrime*u(i+1,j+1);
+
+    end
+  end
+  
+  u = applyBCs(u);
+
+end
+
+end--------------
+<smoothQJacDamped.m>
+function u = smoothQJacDamped(f,DeW,DnS,C,u,hf,m,omega)
+
+nfPlusGhostLayers = size(u);
+nf = nfPlusGhostLayers-2;
+
+z = zeros(nf(1),nf(2));
+
+hf2 = hf*hf;
+omegaPrime = 1.0-omega;
+
+u = applyBCs(u);
+
+for sweep = 1:m
+  for j = 1:nf(2)
+    for i = 1:nf(1)
+
+      z(i,j) = (hf2*f(i,j)...
+               +u(i+2,j+1)*DeW(i+1,j  )...
+               +u(i  ,j+1)*DeW(i  ,j  )...
+               +u(i+1,j+2)*DnS(i  ,j+1)...
+               +u(i+1,j  )*DnS(i  ,j  ))...
+               /(DeW(i+1,j)+DeW(i,j)+DnS(i,j+1)...
+               +DnS(i,j)+ C(i,j)*hf2);
+
+    end
+  end
+
+  u(2:nf(1)+1,2:nf(2)+1) = omega*z(1:nf(1),1:nf(2))...
+    + omegaPrime*u(2:nf(1)+1,2:nf(2)+1);
+  u = applyBCs(u);
+
+end
+
+end--------------

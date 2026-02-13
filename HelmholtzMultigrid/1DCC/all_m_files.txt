@@ -1,0 +1,441 @@
+<FDOperator.m>
+function operatorResult = FDOperator(u,DeW,C,hf)
+
+nfPlusGhostLayers = length(u);
+nf = nfPlusGhostLayers-2;
+feW = zeros(nf+1,1);
+operatorResult = zeros(nf,1);
+
+hf2 = hf*hf;
+
+% Vectorized code for the operator:
+% - (D u')' + C(x) u 
+
+% Compute east-west numerical flux:
+feW(1:nf+1) = DeW(1:nf+1).*(u(2:nf+2)-u(1:nf+1));
+
+operatorResult(1:nf) = -(feW(2:nf+1)-feW(1:nf))/hf2...
+                       +C.*u(2:nf+1);
+
+end--------------
+<MGOperator.m>
+function u = MGOperator(level,f,DeW,C,u,hf,MGParam)
+
+% Pre-smoothing
+u = smoothQJacDamped(f,DeW,C,u,hf,MGParam.m1,...
+                     MGParam.omega);
+
+% Alternative pre-smoothing options:
+% u = smoothRichardson(f,DeW,C,u,hf,MGParam.m1,...
+%                      MGParam.omega);
+% u = smoothQGSDamped(f,DeW,C,u,hf,MGParam.m1,...
+%                     MGParam.omega,'fwd');
+
+if level > 0
+  hc = 2*hf;
+  nfPlusGhost = length(u);
+  nf = nfPlusGhost-2;
+
+  % Coarse grid interior dimension is nc.
+  nc = nf/2;
+
+  % Compute the residual and restric to the coarse grid.
+  cGr = restriction(getResidual(u,f,DeW,C,hf));
+    
+  % Restrict the diffusion coefficients to the coarse
+  % grid.
+  cDeW = restrictDiff(DeW);
+    
+  % Restrict the reaction coefficient to the coarse grid.
+  cC = restriction(C);
+  % Injection based restriction.
+  % cC = C(1:2:end);
+  
+  % Approximate on the coarse grid using recursive MG.
+  cGc = zeros(nc+2,1);
+  for s = 1:MGParam.pCycle
+    cGc = MGOperator(level-1,cGr,cDeW,cC,cGc,hc,MGParam);
+  end
+
+  % Prolongate the coarse grid correction and update the
+  % fine grid approximation.
+  u(2:nf+1) = u(2:nf+1)+prolongation(cGc(2:nc+1));
+    
+  % Post-smoothing.
+  u = smoothQJacDamped(f,DeW,C,u,hf,MGParam.m2,...
+                       MGParam.omega);
+
+  % Alternative post-smoothing options:
+  % u = smoothRichardson(f,DeW,C,u,hf,MGParam.m2,...
+  %                      MGParam.omega);
+  % u = smoothQGSDamped(f,DeW,C,u,hf,MGParam.m2,...
+  %                     MGParam.omega,'bwd');
+end
+
+end--------------
+<applyBCs.m>
+function u = applyBCs(u)
+
+nfPlusGhostLayers = length(u);
+nf = nfPlusGhostLayers-2;
+
+% Homogeneous Dirichlet BC:
+
+u(   1) = -u(   2);
+u(nf+2) = -u(nf+1);
+
+% Homogeneous Neumann BC:
+
+% u(   1) = u(   2);
+% u(nf+2) = u(nf+1);
+
+% Periodic BC:
+
+% u(   1) = u(nf+1);
+% u(nf+2) = u(   2);
+
+end--------------
+<elliptic1DMGCCDiff.m>
+%
+%   elliptic1DMGCCDiff.m
+%
+% Calling script for solving the 1D elliptic equation
+%
+%   -(D u')' + C(x) u = f
+%
+% on an interval, where D is a possibly non-constant,
+% everywhere positive diffusion coefficient, and C(x) is a 
+% non-negative function. The boundary conditions may be 
+% taken to be (i) homogeneous Dirichlet,
+% (ii) homogeneous Neumann, or (iii) periodic. 
+% See the function applyBCs.
+% 
+% Discretization is accomplished using the cell-centered 
+% finite difference method. The cell-centered multigrid
+% method is used as the solver.
+%
+% If C(x) is zero everywhere, then homogeneous Dirichlet
+% boundary conditions must be chosen.
+%
+%% Initialization and Parameter
+
+% Clear command line window and workspace.
+clear; clc;
+
+% Tolerance of residual to stop multigrid iterations.
+tol = 1.0e-11;
+
+% Number of interior cells at finest level.
+nL = 1024;
+
+% Number of multigrid levels.
+L = 10;
+
+% Define the domain of the equation.
+xLower = 0.0;
+xUpper = 1.0;
+
+hL = (xUpper-xLower)/nL;
+
+% Parameters for the multigrid solver.
+pCycle = 1;
+m1     = 3;
+m2     = 3;
+omega  = 1/2;
+kMax   = 100;
+
+%% Setting up the multigrid solver
+
+% Check that nL is divisible by 2^L.
+nl = nL;
+for k = L-1:-1:0
+  if any(mod(nl,2) ~= 0)
+    error('nL not divisible by 2^L.  Coarsening error.');
+  end
+  nl = nl/2;
+end
+
+MGParam.nL     = nL;
+MGParam.xLower = xLower;
+MGParam.xUpper = xUpper;
+MGParam.L      = L;
+MGParam.pCycle = pCycle;
+MGParam.m1     = m1;
+MGParam.m2     = m2;
+MGParam.omega  = omega;
+MGParam.kMax   = kMax;
+MGParam.tol    = tol;
+
+% Allocate solution arrays (with ghost layers).
+u      = zeros(nL+2,1);
+uExact = zeros(nL+2,1);
+f      = zeros(nL  ,1);
+xCC    = zeros(nL  ,1);
+DeW    = zeros(nL+1,1);
+C      = zeros(nL  ,1);
+
+% Build an exact solution and define f accordingly, so we
+% can test the true algebraic error.
+for i = 1:nL
+  x = (i-0.5)*hL+xLower;
+  xArg = 3.0*pi*x/xUpper;
+% uExact(i+1) = exp(cos(xArg));
+  uExact(i+1) = exp(sin(xArg))-1.0;
+  xCC(i) = x;
+end
+
+% We next build the finest-grid diffusion array DeW:
+for i = 1:nL+1
+  xEdge = (i-1.0)*hL+xLower;
+  xArg = 2.0*pi*xEdge/xUpper;
+
+% Evaluate D at the east-west edge point:
+% DeW(i) = 1.0+0.5*sin(xArg);
+  DeW(i) = 1.0;
+end
+
+% Define the reaction coefficient C(x) at the cell centers.
+C = 1.5 + sin(2.0*pi*xCC/xUpper);
+
+% Store C in the MGParam struct
+MGParam.C = C;
+
+% Apply the BCs to uExact, then compute f by calling 
+% FDOperator.
+uExact = applyBCs(uExact);
+f = FDOperator(uExact,DeW,C,hL);
+
+%% Call the Multigrid solver.
+
+tic;
+[u,errVals,kStop] = multiGridSolver(u,f,DeW,C,hL,...
+                                    MGParam,uExact);
+toc;
+
+%% Plotting the numerical solution and error plots.
+
+uPlot(1:nL) = u(2:nL+1);
+
+figure(1)
+clf
+
+plot(xCC,uPlot,'b-','LineWidth',1.5);
+title('Numerical Solution u');
+xlabel('x');
+ylabel('u');
+
+figure(2)
+clf
+semilogy(errVals(1:kStop,3),'bo','LineWidth',1.5)
+hold on
+semilogy(errVals(1:kStop,2),'rs','LineWidth',1.5)
+hold on
+semilogy(errVals(1:kStop,1),'kd','LineWidth',1.5)
+hold on
+
+rate = 1.0;
+if kStop >= 4
+  kv = kStop-3:kStop;
+  le = log(errVals(kStop-3:kStop,3));
+  p1 = polyfit(kv,le,1);
+  rate = exp(p1(1));
+  p1k = polyval(p1,1:kStop);
+  semilogy(1:kStop,exp(p1k),'-k')
+else
+  semilogy(errVals(1:kStop,1),'.','LineWidth',1.5)
+end
+
+xlabel('$k$','Interpreter','latex');
+title('Multigrid Iteration Errors',...
+  'Interpreter','latex');
+legend(...
+  '$\left\|{\bf u}_L^{\rm E}-{\bf u}_L^k\right\|_L$',...
+  '$\left\|{\bf u}_L^k-{\bf u}_L^{k-1} \right\|_L$',...
+  '$\left\|{\bf r}_L^k\right\|_L$',...
+  'log-linear fit','Interpreter','latex');
+text(1.5,128*MGParam.tol,strcat(...
+  '$\gamma_{\rm comp} =\hspace{.1cm}$',...
+  num2str(rate,'%10.5e')),'FontSize',14,...
+  'Interpreter','latex')
+text(1.5,32*MGParam.tol,strcat('$m_1 =\hspace{.1cm}$',...
+  num2str(MGParam.m1)),'FontSize',14,...
+  'Interpreter','latex')
+text(1.5,8*MGParam.tol,strcat('$m_2 =\hspace{.1cm}$',...
+  num2str(MGParam.m2)),'FontSize',14,...
+  'Interpreter','latex')
+text(1.5,2*MGParam.tol,strcat('$p =\hspace{.1cm}$',...
+  num2str(MGParam.pCycle)),'FontSize',14,...
+  'Interpreter','latex')
+text(1.5,0.5*MGParam.tol,...
+  strcat('$\omega =\hspace{.1cm}$',...
+  num2str(MGParam.omega)),'FontSize',14,...
+  'Interpreter','latex')
+printstr = strcat('Err_nL_',num2str(MGParam.nL(1)),...
+  '_m1_',num2str(MGParam.m1),'.pdf');
+exportgraphics(gca, printstr)
+hold off--------------
+<getResidual.m>
+function residualResult = getResidual(u,f,DeW,C,hf)
+
+% Apply the boundary conditions before residual 
+% computation.
+u = applyBCs(u);
+nf = length(f);
+residualResult = zeros(nf,1);
+
+residualResult = f-FDOperator(u,DeW,C,hf);
+
+end--------------
+<multiGridSolver.m>
+function [u,errVals,kStop] =...
+              multiGridSolver(u0,f,DeW,C,hf,MGParam,uExact)
+
+nf = length(f);
+k = 0;
+errorVal = MGParam.tol+1.0;
+errVals = zeros(MGParam.kMax,3);
+
+uo = u0;
+
+while ((k < MGParam.kMax) && (errorVal > MGParam.tol))
+
+  % Apply one multigrid cycle.
+  u = MGOperator(MGParam.L,f,DeW,C,uo,hf,MGParam);
+
+  % Evaluate various norms.
+  residErr = normScaledL2(getResidual(u,f,DeW,C,hf));
+  correErr = normScaledL2(uo(2:nf+1)-u(2:nf+1));
+  exactErr = normScaledL2(uExact(2:nf+1)-u(2:nf+1));
+
+  k = k+1;
+  errVals(k,1) = residErr;
+  errVals(k,2) = correErr;
+  errVals(k,3) = exactErr;
+
+  fprintf('Multigrid iteration %d:\n', k);
+  fprintf('  residual   = %.6e\n', residErr);
+  fprintf('  correction = %.6e\n', correErr);
+  fprintf('  true error = %.6e\n', exactErr);
+
+  % Stopping criterion (artificial, for demonstration).
+  errorVal = exactErr;  
+  uo = u;
+end
+
+kStop = k;
+
+end--------------
+<normScaledL2.m>
+function normResult = normScaledL2(u)
+
+nf = length(u);
+normResult = sqrt(sum(u.*u)/nf);
+
+end--------------
+<prolongation.m>
+function presult = prolongation(u)
+
+nc = length(u);
+nf = nc*2;
+presult = zeros(nf,1);
+
+presult(2:2:nf  ) = u(1:nc(1));
+presult(1:2:nf-1) = u(1:nc(1));
+
+end--------------
+<restrictDiff.m>
+function cDeW = restrictDiff(DeW)
+
+nfEw = length(DeW);
+nf = nfEw-1;
+nc = nf/2;
+cDeW = zeros(nc+1,1);
+
+cDeW(1:nc+1) = DeW(1:2:nf+1);
+
+end--------------
+<restriction.m>
+function restrictionResult = restriction(u)
+
+nf = length(u);
+nc = nf/2;
+
+restrictionResult = 0.5*(u(1:2:nf-1)+u(2:2:nf));
+
+end--------------
+<smoothQGSDamped.m>
+function u = smoothQGSDamped(f,DeW,C,u,hf,m,omega,...
+                             sweepDirection)
+
+nfPlusGhostLayers = length(u);
+nf = nfPlusGhostLayers-2;
+
+hf2 = hf*hf;
+omegaPrime = 1.0-omega;
+
+switch sweepDirection
+  case 'fwd'
+    sweepIndex = [1:nf];
+  otherwise
+    sweepIndex = [nf:-1:1];
+end
+
+u = applyBCs(u);
+
+for sweep = 1:m
+  for i = sweepIndex
+
+    tmp = (hf2*f(i)+u(i+2)*DeW(i+1)+u(i)*DeW(i))...
+          /(DeW(i+1)+DeW(i)+C(i)*hf2);
+    u(i+1) = omega*tmp+omegaPrime*u(i+1);
+
+  end
+  u = applyBCs(u);
+
+end
+
+end--------------
+<smoothQJacDamped.m>
+function u = smoothQJacDamped(f,DeW,C,u,hf,m,omega)
+
+nfPlusGhostLayers = length(u);
+nf = nfPlusGhostLayers-2;
+
+z = zeros(nf,1);
+
+hf2 = hf*hf;
+omegaPrime = 1.0-omega;
+
+u = applyBCs(u);
+
+for sweep = 1:m
+  for i = 1:nf
+
+    z(i) = (hf2*f(i)+u(i+2)*DeW(i+1)+u(i)*DeW(i))...
+           /(DeW(i+1)+DeW(i)+C(i)*hf2);
+
+  end
+
+  u(2:nf+1) = omega*z(1:nf)+omegaPrime*u(2:nf+1);
+  u = applyBCs(u);
+  
+end
+
+end--------------
+<smoothRichardson.m>
+function u = smoothRichardson(f,DeW,C,u,hf,m,omega)
+
+nfPlusGhostLayers = length(u);
+nf = nfPlusGhostLayers-2;
+hf2 = hf*hf;
+r = zeros(nf,1);
+
+u = applyBCs(u);
+
+for sweep = 1:m
+  r(1:nf) = getResidual(u,f,DeW,C,hf);
+  u(2:nf+1) = u(2:nf+1)+omega*(hf2/2.0)*r(1:nf);
+  u = applyBCs(u);
+end
+
+end--------------
