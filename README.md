@@ -27,17 +27,16 @@ DiffuseDomainHelmholtz/
 
 The baseline book code solves the generalized Helmholtz operator on a line/box:
 
-- 1D:
+**1D**
+
 $$
-\begin{aligned}
-  -\frac{d}{dx}\left(D(x)\frac{du}{dx}\right) + C(x)u = f(x)
-\end{aligned}
+-\frac{d}{dx}\left(D(x)\frac{du}{dx}\right) + C(x)u = f(x)
 $$
-- 2D:
+
+**2D**
+
 $$
-\begin{aligned}
-  -\nabla\cdot\left(D(x,y)\nabla u\right) + C(x,y)u = f(x,y)
-\end{aligned}
+-\nabla\cdot\left(D(x,y)\nabla u\right) + C(x,y)u = f(x,y)
 $$
 
 with cell-centered finite differences and geometric multigrid. Depending on the script, homogeneous Dirichlet, Neumann, or periodic boundary conditions are supported.
@@ -53,12 +52,7 @@ $$
 The diffuse-domain PDE solved on the box is:
 
 $$
-\begin{aligned}
--\nabla\cdot(D_\varepsilon\nabla u_\varepsilon)
-+ c_\varepsilon u_\varepsilon
-+ (\kappa u_\varepsilon + g)|\nabla \phi_\varepsilon|
-&= f_\varepsilon.
-\end{aligned}
+-\nabla\cdot(D_\varepsilon\nabla u_\varepsilon) + c_\varepsilon u_\varepsilon + (\kappa u_\varepsilon + g)|\nabla \phi_\varepsilon| = f_\varepsilon
 $$
 
 with
