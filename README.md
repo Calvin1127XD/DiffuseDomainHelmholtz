@@ -28,65 +28,67 @@ DiffuseDomainHelmholtz/
 The baseline book code solves the generalized Helmholtz operator on a line/box:
 
 - 1D:
-  \[
+  $$
   -\frac{d}{dx}\left(D(x)\frac{du}{dx}\right) + C(x)u = f(x)
-  \]
+  $$
 - 2D:
-  \[
+  $$
   -\nabla\cdot\left(D(x,y)\nabla u\right) + C(x,y)u = f(x,y)
-  \]
+  $$
 
 with cell-centered finite differences and geometric multigrid. Depending on the script, homogeneous Dirichlet, Neumann, or periodic boundary conditions are supported.
 
 ### Diffuse Domain formulation (refactored code)
 
-For interface/transmission problems, the code embeds the interface problem into a larger Cartesian box using a smooth phase field \(\phi_\varepsilon\), derived from signed distance \(d\):
+For interface/transmission problems, the code embeds the interface problem into a larger Cartesian box using a smooth phase field $\phi_\varepsilon$, derived from signed distance $d$:
 
-\[
+$$
 \phi_\varepsilon = \frac{1}{2}\left(1+\tanh\left(\frac{d}{\varepsilon}\right)\right)
-\]
+$$
 
 The diffuse-domain PDE solved on the box is:
 
-\[
+$$
+\begin{aligned}
 -\nabla\cdot(D_\varepsilon\nabla u_\varepsilon)
 + c_\varepsilon u_\varepsilon
 + (\kappa u_\varepsilon + g)|\nabla \phi_\varepsilon|
-= f_\varepsilon,
-\]
+&= f_\varepsilon.
+\end{aligned}
+$$
 
 with
 
-\[
-D_\varepsilon=\alpha+(1-\alpha)\phi_\varepsilon,
-\quad
-c_\varepsilon=\beta(1-\phi_\varepsilon)+\gamma\phi_\varepsilon,
-\quad
-f_\varepsilon=h(1-\phi_\varepsilon)+q\phi_\varepsilon.
-\]
+$$
+\begin{aligned}
+D_\varepsilon &= \alpha+(1-\alpha)\phi_\varepsilon, \\
+c_\varepsilon &= \beta(1-\phi_\varepsilon)+\gamma\phi_\varepsilon, \\
+f_\varepsilon &= h(1-\phi_\varepsilon)+q\phi_\varepsilon.
+\end{aligned}
+$$
 
 In implementation, this is rearranged into the multigrid solver form
 
-\[
+$$
 -\nabla\cdot(D\nabla u) + Cu = F,
-\]
+$$
 
 where
 
-\[
-D=D_\varepsilon,
-\quad
-C=c_\varepsilon + \kappa|\nabla\phi_\varepsilon|,
-\quad
-F=f_\varepsilon - g|\nabla\phi_\varepsilon|.
-\]
+$$
+\begin{aligned}
+D &= D_\varepsilon, \\
+C &= c_\varepsilon + \kappa|\nabla\phi_\varepsilon|, \\
+F &= f_\varepsilon - g|\nabla\phi_\varepsilon|.
+\end{aligned}
+$$
 
 In 1D one-sided/two-sided examples, the jump condition appears as
-\(u'_R(0)-\alpha u'_L(0)=\kappa u(0)+\lambda\), and its diffuse approximation is built through the \(\phi_\varepsilon\)-weighted coefficients and forcing.
+$u'_R(0)-\alpha u'_L(0)=\kappa u(0)+\lambda$, and its diffuse approximation is built through the $\phi_\varepsilon$-weighted coefficients and forcing.
 
 ## Eikonal / Signed-Distance Step
 
-The 2D DDM codes require a signed distance function to the interface. This is computed by a Fast Marching style solver (MEX C++) and used to build \(\phi_\varepsilon\) and \(|\nabla\phi_\varepsilon|\).
+The 2D DDM codes require a signed distance function to the interface. This is computed by a Fast Marching style solver (MEX C++) and used to build $\phi_\varepsilon$ and $|\nabla\phi_\varepsilon|$.
 
 - Fast option: `mex_computeSignedDistance.cpp`
 - Portable fallback: `computeSignedDistance_MATLAB.m` (slower)
@@ -102,7 +104,7 @@ All included solvers use:
 - Smoothers such as damped Jacobi / damped Gauss-Seidel
 - Restriction/prolongation transfer operators for level coupling
 
-The convergence-analysis folders run parameter sweeps (e.g., in \(\varepsilon\), \(\alpha\), or coupled laws \(\alpha=\varepsilon^p\)) to estimate asymptotic behavior.
+The convergence-analysis folders run parameter sweeps (e.g., in $\varepsilon$, $\alpha$, or coupled laws $\alpha=\varepsilon^p$) to estimate asymptotic behavior.
 
 ## Quick Start (MATLAB)
 
