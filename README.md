@@ -145,7 +145,7 @@ To keep this repository portable and GitHub-friendly, precomputed cache/data fil
 
 ## References
 
-- Paper 1: [arXiv:2412.07007](https://arxiv.org/abs/2412.07007)
-- Paper 2: [arXiv:2504.17148](https://arxiv.org/abs/2504.17148)
-- Book: [A Practical Introduction to the Numerical Solution of Differential Equations](https://www.degruyterbrill.com/document/doi/10.1515/9783111354880/html)
+- Paper 1: [A Diffuse Domain Approximation with Transmission-Type Boundary Conditions I: Asymptotic Analysis and Numerics](https://arxiv.org/abs/2412.07007)
+- Paper 2: [A Diffuse Domain Approximation with Transmission-Type Boundary Conditions II: Gamma--Convergence](https://arxiv.org/abs/2504.17148)
+- Book: [Multigrid Methods](https://doi.org/10.1515/9783111354880)
 - Book repository: [stevenmwise/MultigridCourse](https://github.com/stevenmwise/MultigridCourse)
