@@ -28,13 +28,13 @@ DiffuseDomainHelmholtz/
 The baseline book code solves the generalized Helmholtz operator on a line/box:
 
 - 1D:
-  $$
+  $$\begin{aligned}
   -\frac{d}{dx}\left(D(x)\frac{du}{dx}\right) + C(x)u = f(x)
-  $$
+  \end{aligned}$$
 - 2D:
-  $$
+  $$\begin{aligned}
   -\nabla\cdot\left(D(x,y)\nabla u\right) + C(x,y)u = f(x,y)
-  $$
+  \end{aligned}$$
 
 with cell-centered finite differences and geometric multigrid. Depending on the script, homogeneous Dirichlet, Neumann, or periodic boundary conditions are supported.
 
